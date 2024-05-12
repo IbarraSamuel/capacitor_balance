@@ -1,10 +1,21 @@
-from sqlite3 import connect
-from typing import TypeVar, AsyncGenerator, cast
-from pathlib import Path
 import asyncio
 import random
-from typing import overload
+from pathlib import Path
+from sqlite3 import connect
+from typing import (
+    AsyncGenerator,
+    Collection,
+    Iterable,
+    Protocol,
+    Sequence,
+    Sized,
+    TypeVar,
+    cast,
+    overload,
+)
+
 import polars as pl
+
 # import numpy as np
 # import pandas as pd
 
@@ -24,11 +35,18 @@ Generation = list[Genoma]
 # GENERIC TYPES
 T = TypeVar("T", Capacitor, Genoma)
 
+
+class IterableSized[T](Collection[T], Protocol):
+    pass
+
+
 @overload
-async def aiter(iterable: list[T]) -> AsyncGenerator[T, None]: ...
+async def aiter[T](iterable: Iterable[T]) -> AsyncGenerator[T, None]: ...
 @overload
-async def aiter(iterable: list[T], slice: int) -> AsyncGenerator[list[T], None]:...
-async def aiter(iterable: list[T], slice: int | None = None) -> AsyncGenerator[T | list[T], None]:
+async def aiter[S: Sequence](iterable: S, slice: int) -> AsyncGenerator[S, None]: ...
+async def aiter[T](
+    iterable: Sequence[T] | Iterable[T], slice: int | None = None
+) -> AsyncGenerator[T | Sequence[T], None]:
     """
     aiter creater an asyncronous generator to use in async for and
     async comprehensions
@@ -45,8 +63,7 @@ async def aiter(iterable: list[T], slice: int | None = None) -> AsyncGenerator[T
         Iterator[list]: values inside the iterable input or parts that the input is
         splitted
     """
-    # assert hasattr(iterable, "__iter__")
-    if slice is not None:
+    if slice is not None and isinstance(iterable, Sized):
         assert slice >= 1
         assert len(iterable) % slice == 0
         assert slice <= len(iterable)
@@ -59,33 +76,23 @@ async def aiter(iterable: list[T], slice: int | None = None) -> AsyncGenerator[T
             yield val
 
 
-async def get_df(excel_file: Path, db_file: Path) -> pd.DataFrame:
-    if not db_file.exists():
-        df: pd.DataFrame = pd.read_excel(
-            excel_file,
-            sheet_name="DATOS DE CAPACITORES ",
-            header=4,
-            index_col=0,
-            usecols="A:D",
-        )
-        with connect(db_file) as conn:
-            df.to_sql("capacitors", conn)
-    else:
-        with connect(db_file) as conn:
-            df = pd.read_sql_query("SELECT * FROM capacitors", conn, index_col="N°")
+async def get_df(db_file: Path) -> pl.DataFrame:
+    with connect(db_file) as conn:
+        df = pl.read_database("SELECT * FROM capacitors", conn)
+        print(df)
     return df
 
 
-async def parallel_reduction(capacitance_arr: np.ndarray) -> float:
-    return np.sum(capacitance_arr)
+async def parallel_reduction(capacitance_arr: pl.Series) -> float:
+    return capacitance_arr.sum()
 
 
-async def series_reduction(capacitance_arr: np.ndarray) -> float:
-    return 1 / np.sum(1 / capacitance_arr)
+async def series_reduction(capacitance_arr: pl.Series) -> float:
+    return 1 / (1 / capacitance_arr).sum()
 
 
-async def standard_deviation(values: np.ndarray) -> float:
-    return np.std(values)
+async def standard_deviation(values: pl.Series) -> float:
+    return cast(float, values.std())
 
 
 async def map_capacitance(gen: Genoma) -> list[float]:
@@ -103,15 +110,15 @@ async def generation_hash(gen: Generation) -> str:
 async def fitness(gen: Genoma) -> float:
     tot_caps = await map_capacitance(gen)
     parallel = [
-        await parallel_reduction(caps)
-        async for caps in aiter(np.array(tot_caps), slice=9)
+        await parallel_reduction(pl.Series(caps))
+        async for caps in aiter(tot_caps, slice=9)
     ]
     series = [
-        await series_reduction(groups)
-        async for groups in aiter(np.array(parallel), slice=6)
+        await series_reduction(pl.Series(groups))
+        async for groups in aiter(parallel, slice=6)
     ]
-    phase_deviation = await standard_deviation(series)
-    group_deviation = await standard_deviation(parallel)
+    phase_deviation = await standard_deviation(pl.Series(series))
+    group_deviation = await standard_deviation(pl.Series(parallel))
     return 20 * phase_deviation + group_deviation
 
 
@@ -125,16 +132,18 @@ async def sort_generation(generation: Generation) -> Generation:
     return generation_sorted
 
 
-async def df_to_cap_list(df: pd.DataFrame) -> list[Capacitor]:
+async def df_to_cap_list(df: pl.DataFrame) -> list[Capacitor]:
     assert set(df.columns).issuperset(["CAPACITANCIA ", "N° DE SERIE"])
-    valid = df.loc[df["CAPACITANCIA "].notna()]
-    return (
-        valid.apply(
-            lambda s: Capacitor(s.name, s["N° DE SERIE"], s["CAPACITANCIA "]), axis=1
-        )
-        .to_numpy()
-        .tolist()
-    )
+    valid = df.filter(
+        pl.col("CAPACITANCIA ").is_null().not_()
+    )  # df.loc[df["CAPACITANCIA "].notna()]
+    print(valid)
+    return [
+        Capacitor(nm, sr, cap)
+        for nm, sr, cap in valid.select(
+            "index", "N° DE SERIE", "CAPACITANCIA "
+        ).iter_rows()
+    ]
 
 
 async def possible_options(
@@ -250,11 +259,13 @@ async def update_generation(
     # ]
 
 
-def get_selected_capacitors(genoma: Genoma, original_df: pd.DataFrame) -> pd.DataFrame:
+def get_selected_capacitors(genoma: Genoma, original_df: pl.DataFrame) -> pl.DataFrame:
     assert set(genoma).__len__() == genoma.__len__()
 
-    index_list = [cap.id - 1 for cap in genoma]
-    selected_df: pd.DataFrame = original_df.iloc[index_list]
+    index_list = [cap.serial for cap in genoma]
+    selected_df: pl.DataFrame = original_df.filter(
+        pl.col("N° DE SERIE").is_in(index_list)
+    )
     return selected_df
 
 
@@ -262,14 +273,13 @@ async def main():
     # Folders
     MAIN_FOLDER = Path(__file__).parent
     DB_FILE = MAIN_FOLDER / "capacitors.db"
-    EXCEL_FILE = MAIN_FOLDER / "CAPACITORES.xlsx"
+    # EXCEL_FILE = MAIN_FOLDER / "CAPACITORES.xlsx"
     RESULT_FILE = MAIN_FOLDER / "parallel_results.xlsx"
 
     # Genoma
     GENOMA_LENGTH = 3 * 6 * 9
     GENERATION_LENGTH = 1000
     ITERATIONS = 500
-
     # Generation Distribution
     BEST_GENOMAS_LENGTH = int(GENERATION_LENGTH * 10 / 100)
     MUTATION_LENGTH = int(GENERATION_LENGTH * 20 / 100)
@@ -286,42 +296,73 @@ async def main():
         + RANDOM_LENGTH
     )
 
-    df = await get_df(EXCEL_FILE, DB_FILE)
+    df = await get_df(DB_FILE)
     print(df)
 
     # Here we are getting the count of Capacitores by deviation
-    df_by_deviation = df.groupby(["CAP. DESVIACION "]).count()["N° DE SERIE"]
-    print(df_by_deviation)
+    df_by_deviation = df.group_by(["CAP. DESVIACION "]).agg(pl.count("N° DE SERIE"))[
+        "N° DE SERIE"
+    ]
+    df_by_deviation = df.select(
+        pl.col("CAP. DESVIACION ").alias("dev"),
+        pl.len().over("CAP. DESVIACION ").alias("count"),
+    ).unique()
+    print("count of capacitors for each deviation", df_by_deviation)
 
     # Percent of the total Each Deviation
-    deviation_percent = df_by_deviation / cast(int, df_by_deviation.sum())
-    print(deviation_percent)
+    deviation_percent = df_by_deviation["count"] / df_by_deviation["count"].sum()
+    print("Percent from the total available", deviation_percent)
 
     # Now we got the numbers needed for the lenght of the genoma (Integers).
-    distribution = (GENOMA_LENGTH * deviation_percent).round()
-    print(distribution)
+    distribution = (GENOMA_LENGTH * deviation_percent).floor()
+    print("how many we should use to meet the total required", distribution)
+
+    print("distribution sum:", distribution.sum())
 
     # if the distribution sum is less than GENOMA_LENGTH, we need to add the missing
     if distribution.sum() < GENOMA_LENGTH:
-        print(GENOMA_LENGTH - distribution.sum())
-        print(distribution.loc[2])
-        distribution.loc[2] = GENOMA_LENGTH - distribution.sum()
+        print("we are missing", GENOMA_LENGTH - distribution.sum())
+        print(
+            "for each deviation we have available:",
+            df_by_deviation["count"] - distribution,
+        )
+        print(
+            "lets take from the shortest to the biggest until we fulfill the requirement."
+        )
+        needed = GENOMA_LENGTH - distribution.sum()
+        while needed > 0:
+            available = df_by_deviation["count"] - distribution
+            available = available.filter(available != 0)
+            print(f"availables are: {available}")
+            lower_value: int = min(available)
+            pos = next(i for i, v in enumerate(available) if v == lower_value)
+            print(
+                f"position for the min {lower_value} is {pos}. We will use {min(needed, lower_value)} to modify this value."
+            )
+            distribution[pos] = distribution[pos] + min(needed, lower_value)
+            needed -= min(needed, lower_value)
+            print(f"now the dist is: {distribution}")
 
-    print(distribution)
+    print("Distribution:", distribution)
 
     assert distribution.sum() == GENOMA_LENGTH
     # cap_list = await df_to_cap_list(df)
-    cap_selected_df = pd.DataFrame([])
+    cap_selected_df = pl.DataFrame([])
 
     # Here for each deviation, we got the capacitors from the dataframe
-    async for dv, num in aiter(distribution.items()):
+    async for dv, num in aiter(df_by_deviation.iter_rows()):
         # Take all the capacitors with the selected deviation
-        possible = df.loc[df["CAP. DESVIACION "] == dv]
+        possible = df.filter(pl.col("CAP. DESVIACION ").eq(dv))
         # Take from the list of capacitors, the number of capacitors
         # with the selected deviation, and add them to the dataframe
-        cap_selected_df = pd.concat([cap_selected_df,
-            possible.take(list(range(round(num)))
-        )])
+        cap_selected_df = pl.concat(
+            [
+                cap_selected_df,
+                possible.with_row_index().filter(
+                    pl.col("index").is_in(list(range(round(num))))
+                ),
+            ]
+        )
 
     capacitor_options = await df_to_cap_list(cap_selected_df)
 
@@ -344,7 +385,7 @@ async def main():
 
     best_genoma = generation[0]
     capacitors_df = get_selected_capacitors(best_genoma, df)
-    capacitors_df.to_excel(RESULT_FILE, "Capacitors Balanced")
+    capacitors_df.write_excel(RESULT_FILE, "Capacitors Balanced")
     print("DONE!")
 
 

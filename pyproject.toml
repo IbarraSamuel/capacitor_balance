@@ -1,11 +1,9 @@
 [project]
 name = "capacitor-balance"
 version = "0.1.0"
-description = "Add your description here"
-authors = [
-    { name = "Samuel Ibarra", email = "ing.samuelibarra@gmail.com" }
-]
-dependencies = []
+description = "Balance Capacitors for Substations"
+authors = [{ name = "Samuel Ibarra", email = "ing.samuelibarra@gmail.com" }]
+dependencies = ["polars>=0.20.25", "xlsxwriter>=3.2.0"]
 readme = "README.md"
 requires-python = ">= 3.8"
 
@@ -15,7 +13,12 @@ build-backend = "hatchling.build"
 
 [tool.rye]
 managed = true
-dev-dependencies = []
+dev-dependencies = [
+    "ruff-lsp>=0.0.53",
+    "pyright>=1.1.362",
+    "typos>=1.21.0",
+    "ruff>=0.4.4",
+]
 
 [tool.hatch.metadata]
 allow-direct-references = true
