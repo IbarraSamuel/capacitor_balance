@@ -1,3 +1,2 @@
 # capacitor-balance
-
-Describe your project here.
+Balance your Capacitor array
