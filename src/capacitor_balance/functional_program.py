@@ -64,9 +64,7 @@ async def _aiter[T](  # ruff: ignore[unused-async]
 
 def get_df(db_file: Path) -> pl.DataFrame:
     with connect(db_file) as conn:
-        df = pl.read_database("SELECT * FROM capacitors", conn)  # pyright: ignore[reportUnknownMemberType]
-        print(df)  # ruff: ignore[print]
-    return df
+        return pl.read_database("SELECT * FROM capacitors", conn)  # pyright: ignore[reportUnknownMemberType]
 
 
 def parallel_reduction(capacitance_arr: pl.Series) -> float | Decimal:
@@ -104,9 +102,9 @@ def fitness(gen: Genoma) -> float:
         .with_columns((20 * pl.col("cap").std() + pl.col("par_std")).alias("std"))
     )
 
-    print(calc_result)  # ruff: ignore[print]
     result: float = float(calc_result["std"][0])
     """
+    # print(calc_result)
     # parallel = [
     #     await parallel_reduction(pl.Series(caps))
     #     async for caps in aiter(tot_caps, slice=9)
@@ -321,10 +319,10 @@ async def main() -> None:
     # Folders
 
     df = get_df(DB_FILE)
-    print(df)  # ruff: ignore[print]
 
     # Here we are getting the count of Capacitores by deviation
     """
+    # print(df)
     # df_by_deviation = df.group_by(["CAP. DESVIACION "]).agg(pl.count("N° DE SERIE"))[
     #     "N° DE SERIE"
     # ]
@@ -333,43 +331,53 @@ async def main() -> None:
         pl.col("CAP. DESVIACION ").alias("dev"),
         pl.len().over("CAP. DESVIACION ").alias("count"),
     ).unique()
-    print("count of capacitors for each deviation", df_by_deviation)  # ruff: ignore[print]
 
     # Percent of the total Each Deviation
     deviation_percent = df_by_deviation["count"] / df_by_deviation["count"].sum()
-    print("Percent from the total available", deviation_percent)  # ruff: ignore[print]
 
     # Now we got the numbers needed for the lenght of the genoma (Integers).
     distribution = (GENOMA_LENGTH * deviation_percent).floor()
-    print("how many we should use to meet the total required", distribution)  # ruff: ignore[print]
 
-    print("distribution sum:", distribution.sum())  # ruff: ignore[print]
+    """
+    # print("count of capacitors for each deviation", df_by_deviation)
+    # print("Percent from the total available", deviation_percent)
+    # print("how many we should use to meet the total required", distribution)
+    # print("distribution sum:", distribution.sum())
+    """
 
     # if the distribution sum is less than GENOMA_LENGTH, we need to add the missing
     if distribution.sum() < GENOMA_LENGTH:
-        print("we are missing", GENOMA_LENGTH - distribution.sum())  # ruff: ignore[print]
-        print(  # ruff: ignore[print]
-            "for each deviation we have available:",
-            df_by_deviation["count"] - distribution,
-        )
-        print(  # ruff: ignore[print]
-            "lets take from the shortest to the biggest til we fulfill the requirement"
-        )
+        """
+        # print("we are missing", GENOMA_LENGTH - distribution.sum())
+        # print(
+        #     "for each deviation we have available:",
+        #     df_by_deviation["count"] - distribution,
+        # )
+        # print(
+        #     "lets take from the shortest to the biggest til we fulfill "
+        #     "the requirement"
+        # )
+        """
         needed = GENOMA_LENGTH - float(distribution.sum())
         while needed > 0:
             available = df_by_deviation["count"] - distribution
             available = available.filter(available != 0)
-            print(f"availables are: {available}")  # ruff: ignore[print]
             lower_value: int = min(available)
             pos = next(i for i, v in enumerate(available) if v == lower_value)
-            print(  # ruff: ignore[print]
-                f"position for the min {lower_value} is {pos}. We will use {min(needed, lower_value)} to modify this value."  # ruff: ignore[line-too-long]
-            )
             distribution[pos] += min(needed, lower_value)
             needed -= min(needed, lower_value)
-            print(f"now the dist is: {distribution}")  # ruff: ignore[print]
+            """
+            # print(f"availables are: {available}")
+            # print(
+            #     f"position for the min {lower_value} is {pos}. "
+            #     f"We will use {min(needed, lower_value)} to modify this value."
+            # )
+            # print(f"now the dist is: {distribution}")
+            """
 
-    print("Distribution:", distribution)  # ruff: ignore[print]
+    """
+    # print("Distribution:", distribution)
+    """
 
     assert distribution.sum() == GENOMA_LENGTH  # ruff: ignore[assert]
     cap_selected_df = pl.DataFrame([])
