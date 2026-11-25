@@ -1,27 +1,68 @@
 [project]
 name = "capacitor-balance"
 version = "0.1.0"
-description = "Balance Capacitors for Substations"
-authors = [{ name = "Samuel Ibarra", email = "ing.samuelibarra@gmail.com" }]
-dependencies = ["polars>=0.20.25", "xlsxwriter>=3.2.0"]
+description = "Add your description here"
 readme = "README.md"
-requires-python = ">= 3.8"
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.rye]
-managed = true
-dev-dependencies = [
-    "ruff-lsp>=0.0.53",
-    "pyright>=1.1.362",
-    "typos>=1.21.0",
-    "ruff>=0.4.4",
+requires-python = ">=3.13"
+dependencies = [
+    "polars>=2.2.0",
+    "xlsxwriter>=3.3.4",
 ]
 
-[tool.hatch.metadata]
-allow-direct-references = true
+[tool.ty.analysis]
+strict-equality-semantics = true
+strict-generic-narrowing = true
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/capacitor_balance"]
+[tool.ty.rules]
+blanket-ignore-comment = "error"
+dynamic-function-decorator-return = "error"
+missing-type-argument = "error"
+unsound-assignment = "error"
+unsound-return = "error"
+unsound-yield = "error"
+
+[tool.ty.terminal]
+error-on-warning = true
+
+[tool.ruff]
+line-length = 88
+# Optional: Ruff automatically infers this from `requires-python` if omitted
+# target-version = "py312"
+
+[tool.ruff.lint]
+preview = true
+select = ["ALL"]
+ignore = [
+  # Conflicting docstring style rules (choose one convention instead)
+  "undocumented-public-function",
+  "missing-copyright-notice",
+  "D203",   # incorrect-blank-line-before-class (conflicts with D211)
+  "D212",   # multi-line-summary-first-line (conflicts with D213)
+
+  # Rules that conflict with `ruff format`
+  "COM812", # missing-trailing-comma
+  "COM819", # prohibited-trailing-comma
+  "D206",   # docstring-tab-indentation
+  "D300",   # triple-single-quotes
+  "E111",   # indentation-with-invalid-multiple
+  "E114",   # indentation-with-invalid-multiple-comment
+  "E117",   # over-indented
+  "ISC001", # single-line-implicit-string-concatenation
+  "ISC002", # multi-line-implicit-string-concatenation
+  "Q000",   # bad-quotes-inline-string
+  "Q001",   # bad-quotes-multiline-string
+  "Q002",   # bad-quotes-docstring
+  "Q003",   # avoidable-escaped-quote
+  "W191",   # tab-indentation
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+  "S101",    # Allow `assert` in tests
+  "ANN",     # Optional: relax strict type annotations in tests
+  "D",       # Optional: relax docstring requirements in tests
+  "PLR2004", # Allow magic value comparisons in tests
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google" # Or "numpy" / "pep257"
