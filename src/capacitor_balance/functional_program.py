@@ -1,14 +1,11 @@
 """Async solver for Capacitor balance."""
-# ruff: noqa: undocumented-public-function
 
-from types import AsyncGeneratorType
 import asyncio
 import operator
 import random
 from collections.abc import (
     AsyncGenerator,
     Iterable,
-    Iterator,
     Sequence,
 )
 from decimal import Decimal
@@ -22,9 +19,9 @@ import polars as pl
 class Capacitor(TypedDict):
     """Represents a capacitor."""
 
-    id: str
-    serial: int
-    capacitance: float
+    idx: int
+    serial: str
+    cap: float
 
 
 type Genoma = list[Capacitor]
@@ -34,14 +31,12 @@ type Generation = list[Genoma]
 
 
 @overload
-async def _aiter[T](iterable: Iterable[T]) -> AsyncGenerator[T]: ...
+def _aiter[T](iterable: Iterable[T]) -> AsyncGenerator[T]: ...
 @overload
-async def _aiter[T](
-    iterable: Sequence[T], _slice: int
-) -> AsyncGenerator[Sequence[T]]: ...
-async def _aiter[T](
+def _aiter[T](iterable: Sequence[T], _slice: int) -> AsyncGenerator[Sequence[T]]: ...
+async def _aiter[T](  # ruff: ignore[unused-async]
     iterable: Iterable[T] | Sequence[T], _slice: int | None = None
-) -> AsyncGeneratorType[T | Sequence[T]]:
+) -> AsyncGenerator[T | Sequence[T]]:
     """
     Aiter creater an asyncronous generator to use in async for and async comprehensions.
 
@@ -91,18 +86,22 @@ def map_capacitance(gen: Genoma) -> pl.Series:
 
 
 def generation_hash(gen: Generation) -> str:
-    return str(pl.DataFrame(gen).get_column("id").str.join()[0])
+    return str(pl.DataFrame(gen).get_column("serial").str.join()[0])
 
 
 def fitness(gen: Genoma) -> float:
     calc_result = (
         pl.DataFrame(gen)
-        .group_by(pl.len() // 9)
+        .group_by(pl.int_range(pl.len()) // 9, maintain_order=True)
         .agg(pl.sum("cap"))
         .with_columns(pl.col("cap").std().alias("par_std"))
-        .group_by(pl.col("par_std"), pl.len() // 6)
-        .agg(1 / (1 / pl.col("cap")).sum())
-        .with_columns(20 * pl.col("cap").std().alias("std") + pl.col("par_std"))
+        .group_by(
+            pl.col("par_std"),
+            pl.int_range(pl.len()) // 6,
+            maintain_order=True,
+        )
+        .agg((1 / (1 / pl.col("cap")).sum()).alias("cap"))
+        .with_columns((20 * pl.col("cap").std() + pl.col("par_std")).alias("std"))
     )
 
     print(calc_result)  # ruff: ignore[print]
@@ -153,11 +152,12 @@ async def sort_generation(generation: Generation) -> Generation:
 def possible_options(
     capacitor_options: list[Capacitor], current_genoma: Genoma
 ) -> list[Capacitor]:
-    return list(
-        *pl.DataFrame(capacitor_options)
-        .join(pl.DataFrame(current_genoma), on="id", how="anti")
+    return [
+        cast("Capacitor", row)
+        for row in pl.DataFrame(capacitor_options)
+        .join(pl.DataFrame(current_genoma), on="serial", how="anti")
         .rows(named=True)
-    )
+    ]
 
 
 def random_genoma(capacitor_options: list[Capacitor], genoma_length: int) -> Genoma:
@@ -178,9 +178,13 @@ def random_generation(
 
 
 async def crossover_genoma(gen1: Genoma, gen2: Genoma) -> Genoma:
-    possible = pl.DataFrame(gen1).remove(pl.DataFrame(gen2))
+    possible = (
+        pl.DataFrame(gen2)
+        .join(pl.DataFrame(gen1), on="serial", how="anti")
+        .rows(named=True)
+    )
     return [
-        g2 if g2 in possible.rows() and random.getrandbits(1) == 1 else g1
+        g2 if g2 in possible and random.getrandbits(1) == 1 else g1
         async for g1, g2 in _aiter(zip(gen1, gen2, strict=True))
     ]
 
@@ -279,7 +283,7 @@ async def update_generation(  # ruff: ignore[too-many-arguments]
 
 
 def get_selected_capacitors(genoma: Genoma, original_df: pl.DataFrame) -> pl.DataFrame:
-    assert len(set(genoma)) == len(genoma)  # ruff: ignore[assert]
+    assert len({cap["serial"] for cap in genoma}) == len(genoma)  # ruff: ignore[assert]
 
     index_list = [cap["serial"] for cap in genoma]
     selected_df: pl.DataFrame = original_df.filter(
@@ -385,16 +389,14 @@ async def main() -> None:
             ]
         )
 
-    capacitor_options = cast(
-        "list[Capacitor]",
-        list(
-            cap_selected_df.select(
-                pl.col("index").alias("idx"),
-                pl.col("N° DE SERIE").alias("serial"),
-                pl.col("CAPACITANCIA ").alias("cap"),
-            ).rows(named=True)
-        ),
-    )
+    capacitor_options: list[Capacitor] = [
+        Capacitor(idx=idx, serial=serial, cap=cap)
+        for idx, serial, cap in cap_selected_df.select(
+            pl.col("index"),
+            pl.col("N° DE SERIE"),
+            pl.col("CAPACITANCIA "),
+        ).iter_rows()
+    ]
 
     generation = random_generation(capacitor_options, GENERATION_LENGTH, GENOMA_LENGTH)
 
