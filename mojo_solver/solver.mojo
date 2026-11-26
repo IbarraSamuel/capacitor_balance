@@ -1,8 +1,10 @@
-"""High-performance Mojo solver for Capacitor Balance.
+"""High-performance Mojo solver for 3-phase (A, B, C) Capacitor Balance.
 
-Implements two solver modes on the same 3-phase x 6-series x 9-parallel
-(162-capacitor) balancing problem as the Python/Polars version:
+Supports arbitrary 3-phase bank sizes via `--series` (series groups per phase)
+and `--parallel` (capacitors in parallel per group), always using 3 phases
+(total bank size = 3 * series * parallel).
 
+Implements two solver modes:
 1. `ga`: Exact genetic algorithm parity (1000 population x 500 iterations,
    10% elite / 20% mutation / 30% shuffle / 10% crossover / 30% random) using
    flat contiguous arrays, SIMD reductions, and O(1) stamp-array membership.
@@ -12,24 +14,30 @@ Implements two solver modes on the same 3-phase x 6-series x 9-parallel
 """
 
 from std.ffi import OwnedDLHandle, c_int
-from std.math import sqrt
+from std.math import max, sqrt
 from std.sys import CompilationTarget, argv
 from std.time import perf_counter
 
 comptime NUM_PHASES = 3
-comptime GROUPS_PER_PHASE = 6
-comptime CAPS_PER_GROUP = 9
-comptime NUM_GROUPS = NUM_PHASES * GROUPS_PER_PHASE  # 18
-comptime GENOMA_LENGTH = NUM_GROUPS * CAPS_PER_GROUP  # 162
+comptime DEFAULT_SERIES = 6
+comptime DEFAULT_PARALLEL = 9
+comptime DEFAULT_GENERATION_LENGTH = 1000
+comptime DEFAULT_ITERATIONS = 500
 
-# Genetic algorithm parameters (matching functional_program.py)
-comptime GENERATION_LENGTH = 1000
-comptime ITERATIONS = 500
-comptime BEST_GENOMAS_LENGTH = 100
-comptime MUTATION_LENGTH = 200
-comptime SHUFFLE_LENGTH = 300
-comptime CROSSOVER_LENGTH = 100
-comptime RANDOM_LENGTH = 300
+
+struct BankConfig(TrivialRegisterPassable):
+    """3-phase (A, B, C) series-parallel capacitor bank dimensions."""
+
+    var groups_per_phase: Int
+    var caps_per_group: Int
+    var num_groups: Int
+    var genoma_length: Int
+
+    def __init__(out self, groups_per_phase: Int, caps_per_group: Int):
+        self.groups_per_phase = groups_per_phase
+        self.caps_per_group = caps_per_group
+        self.num_groups = NUM_PHASES * groups_per_phase
+        self.genoma_length = self.num_groups * caps_per_group
 
 
 struct Rng(TrivialRegisterPassable):
@@ -166,29 +174,39 @@ def load_capacitors(db_path: String) raises -> CapacitorData:
 
 @inline(.always)
 def fitness_from_group_sums(
-    group_sums: Array[Float64, NUM_GROUPS],
+    group_sums: Span[Float64, _],
+    config: BankConfig,
 ) -> Float64:
-    """Compute exact ddof=1 fitness from the 18 parallel group sums.
+    """Compute exact ddof=1 fitness from the parallel group sums.
 
-    Uses two-pass variance so results remain accurate down to ~1e-16 without
-    catastrophic cancellation.
+    Uses two-pass SIMD-4 variance so results remain accurate down to ~1e-16
+    without catastrophic cancellation for any bank size.
     """
-    # Parallel group mean & sample std (ddof=1 over 18 groups) using SIMD-4
+    var num_groups = config.num_groups
+    var groups_per_phase = config.groups_per_phase
+
+    # Parallel group mean (SIMD-4 + scalar tail)
     var sum_vec = SIMD[.float64, 4](0.0)
-    comptime for g in range(0, 16, 4):
+    var g = 0
+    while g + 4 <= num_groups:
         sum_vec += SIMD[.float64, 4](
             group_sums[g],
             group_sums[g + 1],
             group_sums[g + 2],
             group_sums[g + 3],
         )
-    var par_mean = (
-        sum_vec.reduce_add() + group_sums[16] + group_sums[17]
-    ) / Float64(NUM_GROUPS)
+        g += 4
+    var par_sum = sum_vec.reduce_add()
+    while g < num_groups:
+        par_sum += group_sums[g]
+        g += 1
+    var par_mean = par_sum / Float64(num_groups)
 
+    # Parallel group sample variance (ddof=1, SIMD-4 + scalar tail)
     var mean_vec = SIMD[.float64, 4](par_mean)
     var sq_vec = SIMD[.float64, 4](0.0)
-    comptime for g in range(0, 16, 4):
+    g = 0
+    while g + 4 <= num_groups:
         var diff = (
             SIMD[.float64, 4](
                 group_sums[g],
@@ -199,28 +217,34 @@ def fitness_from_group_sums(
             - mean_vec
         )
         sq_vec += diff * diff
-    var d16 = group_sums[16] - par_mean
-    var d17 = group_sums[17] - par_mean
-    var par_var = (sq_vec.reduce_add() + d16 * d16 + d17 * d17) / Float64(
-        NUM_GROUPS - 1
-    )
+        g += 4
+    var par_sq = sq_vec.reduce_add()
+    while g < num_groups:
+        var d = group_sums[g] - par_mean
+        par_sq += d * d
+        g += 1
+    var par_var = par_sq / Float64(num_groups - 1)
     var par_std = sqrt(par_var) if par_var > 0.0 else 0.0
 
-    # Series reduction for each of the 3 phases (6 groups in series)
+    # Series reduction for each of the 3 phases (A, B, C)
     var phase_caps = Array[Float64, NUM_PHASES](fill=0.0)
     comptime for p in range(NUM_PHASES):
-        var base = p * GROUPS_PER_PHASE
-        var v4 = SIMD[.float64, 4](
-            group_sums[base],
-            group_sums[base + 1],
-            group_sums[base + 2],
-            group_sums[base + 3],
-        )
-        var inv_sum = (
-            (SIMD[.float64, 4](1.0) / v4).reduce_add()
-            + 1.0 / group_sums[base + 4]
-            + 1.0 / group_sums[base + 5]
-        )
+        var base = p * groups_per_phase
+        var inv_vec = SIMD[.float64, 4](0.0)
+        var s = 0
+        while s + 4 <= groups_per_phase:
+            var v4 = SIMD[.float64, 4](
+                group_sums[base + s],
+                group_sums[base + s + 1],
+                group_sums[base + s + 2],
+                group_sums[base + s + 3],
+            )
+            inv_vec += SIMD[.float64, 4](1.0) / v4
+            s += 4
+        var inv_sum = inv_vec.reduce_add()
+        while s < groups_per_phase:
+            inv_sum += 1.0 / group_sums[base + s]
+            s += 1
         phase_caps[p] = 1.0 / inv_sum
 
     # Phase sample std (ddof=1 over 3 phases)
@@ -238,35 +262,31 @@ def fitness_from_group_sums(
 def compute_fitness(
     genoma: Span[Int32, _],
     caps: Span[Float64, _],
+    mut group_sums: List[Float64],
+    config: BankConfig,
 ) -> Float64:
-    """Evaluate a 162-element genoma directly from capacitance array."""
-    var group_sums = Array[Float64, NUM_GROUPS](fill=0.0)
-    comptime for g in range(NUM_GROUPS):
-        var base = g * CAPS_PER_GROUP
-        var s = (
-            caps[Int(genoma[base])]
-            + caps[Int(genoma[base + 1])]
-            + caps[Int(genoma[base + 2])]
-            + caps[Int(genoma[base + 3])]
-            + caps[Int(genoma[base + 4])]
-            + caps[Int(genoma[base + 5])]
-            + caps[Int(genoma[base + 6])]
-            + caps[Int(genoma[base + 7])]
-            + caps[Int(genoma[base + 8])]
-        )
+    """Evaluate a genoma directly from capacitance array using scratch buffer.
+    """
+    var caps_per_group = config.caps_per_group
+    for g in range(config.num_groups):
+        var base = g * caps_per_group
+        var s = 0.0
+        for k in range(caps_per_group):
+            s += caps[Int(genoma[base + k])]
         group_sums[g] = s
-    return fitness_from_group_sums(group_sums)
+    return fitness_from_group_sums(Span(group_sums), config)
 
 
 def fill_random_genoma(
     mut dst: List[Int32],
     dst_offset: Int,
     mut pool: List[Int32],
+    genoma_length: Int,
     mut rng: Rng,
 ):
-    """Partial Fisher-Yates sample of GENOMA_LENGTH distinct indices."""
+    """Partial Fisher-Yates sample of genoma_length distinct indices."""
     var n = len(pool)
-    for i in range(GENOMA_LENGTH):
+    for i in range(genoma_length):
         var j = i + rng.next_int(n - i)
         var tmp = pool[i]
         pool[i] = pool[j]
@@ -276,43 +296,46 @@ def fill_random_genoma(
 
 def run_ga(
     caps: List[Float64],
+    config: BankConfig,
+    generation_length: Int,
     iterations: Int,
     seed: UInt64,
     verbose: Bool = False,
 ) -> SolveResult:
     """Faithful Mojo port of functional_program.py's Genetic Algorithm."""
-    comptime assert (
-        GENERATION_LENGTH
-        == BEST_GENOMAS_LENGTH
-        + MUTATION_LENGTH
-        + SHUFFLE_LENGTH
-        + CROSSOVER_LENGTH
-        + RANDOM_LENGTH
-    ), "Generation distribution must sum to GENERATION_LENGTH"
-
     var t0 = perf_counter()
     var num_caps = len(caps)
+    var genoma_len = config.genoma_length
+    var best_len = max(1, (generation_length * 10) // 100)
+    var mut_len = (generation_length * 20) // 100
+    var shuff_len = (generation_length * 30) // 100
+    var cross_len = (generation_length * 10) // 100
+    var rand_len = generation_length - (
+        best_len + mut_len + shuff_len + cross_len
+    )
+
     var rng = Rng(seed)
 
-    # Double-buffered flat populations (GENERATION_LENGTH x GENOMA_LENGTH)
+    # Double-buffered flat populations (generation_length x genoma_len)
     var pop_a = List[Int32](
-        length=GENERATION_LENGTH * GENOMA_LENGTH, fill=Int32(0)
+        length=generation_length * genoma_len, fill=Int32(0)
     )
     var pop_b = List[Int32](
-        length=GENERATION_LENGTH * GENOMA_LENGTH, fill=Int32(0)
+        length=generation_length * genoma_len, fill=Int32(0)
     )
     var pool = List[Int32](capacity=num_caps)
     for i in range(num_caps):
         pool.append(Int32(i))
 
     # Initial random generation
-    for g in range(GENERATION_LENGTH):
-        fill_random_genoma(pop_a, g * GENOMA_LENGTH, pool, rng)
+    for g in range(generation_length):
+        fill_random_genoma(pop_a, g * genoma_len, pool, genoma_len, rng)
 
-    var scores = List[Float64](length=GENERATION_LENGTH, fill=0.0)
-    var order = List[Int](length=GENERATION_LENGTH, fill=0)
+    var scores = List[Float64](length=generation_length, fill=0.0)
+    var order = List[Int](length=generation_length, fill=0)
     var used_stamp = List[Int32](length=num_caps, fill=Int32(0))
     var avail_buf = List[Int32](capacity=num_caps)
+    var group_sums = List[Float64](length=config.num_groups, fill=0.0)
     var stamp: Int32 = 0
 
     var caps_span = Span(caps)
@@ -320,10 +343,13 @@ def run_ga(
     for it in range(iterations):
         # 1. Evaluate all genomas
         var pop_span = Span(pop_a)
-        for g in range(GENERATION_LENGTH):
-            var off = g * GENOMA_LENGTH
+        for g in range(generation_length):
+            var off = g * genoma_len
             scores[g] = compute_fitness(
-                pop_span[off : off + GENOMA_LENGTH], caps_span
+                pop_span[off : off + genoma_len],
+                caps_span,
+                group_sums,
+                config,
             )
             order[g] = g
 
@@ -338,21 +364,21 @@ def run_ga(
         # 3. Build next generation in pop_b
         var out_idx = 0
 
-        # 3a. Elitism (top BEST_GENOMAS_LENGTH)
-        for k in range(BEST_GENOMAS_LENGTH):
-            var src_off = order[k] * GENOMA_LENGTH
-            var dst_off = out_idx * GENOMA_LENGTH
-            for i in range(GENOMA_LENGTH):
+        # 3a. Elitism
+        for k in range(best_len):
+            var src_off = order[k] * genoma_len
+            var dst_off = out_idx * genoma_len
+            for i in range(genoma_len):
                 pop_b[dst_off + i] = pop_a[src_off + i]
             out_idx += 1
 
-        # 3b. Mutation (MUTATION_LENGTH from top elites)
-        for _ in range(MUTATION_LENGTH):
-            var parent = order[rng.next_int(BEST_GENOMAS_LENGTH)]
-            var src_off = parent * GENOMA_LENGTH
-            var dst_off = out_idx * GENOMA_LENGTH
+        # 3b. Mutation
+        for _ in range(mut_len):
+            var parent = order[rng.next_int(best_len)]
+            var src_off = parent * genoma_len
+            var dst_off = out_idx * genoma_len
             stamp += 1
-            for i in range(GENOMA_LENGTH):
+            for i in range(genoma_len):
                 var c = pop_a[src_off + i]
                 pop_b[dst_off + i] = c
                 used_stamp[Int(c)] = stamp
@@ -363,40 +389,42 @@ def run_ga(
                     avail_buf.append(Int32(c_idx))
 
             if len(avail_buf) > 0:
-                var pos = rng.next_int(GENOMA_LENGTH)
+                var pos = rng.next_int(genoma_len)
                 pop_b[dst_off + pos] = avail_buf[rng.next_int(len(avail_buf))]
             out_idx += 1
 
-        # 3c. Shuffle (SHUFFLE_LENGTH from top elites)
-        for _ in range(SHUFFLE_LENGTH):
-            var parent = order[rng.next_int(BEST_GENOMAS_LENGTH)]
-            var src_off = parent * GENOMA_LENGTH
-            var dst_off = out_idx * GENOMA_LENGTH
-            for i in range(GENOMA_LENGTH):
+        # 3c. Shuffle
+        for _ in range(shuff_len):
+            var parent = order[rng.next_int(best_len)]
+            var src_off = parent * genoma_len
+            var dst_off = out_idx * genoma_len
+            for i in range(genoma_len):
                 pop_b[dst_off + i] = pop_a[src_off + i]
-            for i in range(GENOMA_LENGTH - 1, 0, -1):
+            for i in range(genoma_len - 1, 0, -1):
                 var j = rng.next_int(i + 1)
                 var tmp = pop_b[dst_off + i]
                 pop_b[dst_off + i] = pop_b[dst_off + j]
                 pop_b[dst_off + j] = tmp
             out_idx += 1
 
-        # 3d. Random (RANDOM_LENGTH fresh random genomas)
-        for _ in range(RANDOM_LENGTH):
-            fill_random_genoma(pop_b, out_idx * GENOMA_LENGTH, pool, rng)
+        # 3d. Random
+        for _ in range(rand_len):
+            fill_random_genoma(
+                pop_b, out_idx * genoma_len, pool, genoma_len, rng
+            )
             out_idx += 1
 
-        # 3e. Crossover (CROSSOVER_LENGTH between top elite & past generation)
-        for _ in range(CROSSOVER_LENGTH):
-            var p1 = order[rng.next_int(BEST_GENOMAS_LENGTH)]
-            var p2 = rng.next_int(GENERATION_LENGTH)
-            var off1 = p1 * GENOMA_LENGTH
-            var off2 = p2 * GENOMA_LENGTH
-            var dst_off = out_idx * GENOMA_LENGTH
+        # 3e. Crossover
+        for _ in range(cross_len):
+            var p1 = order[rng.next_int(best_len)]
+            var p2 = rng.next_int(generation_length)
+            var off1 = p1 * genoma_len
+            var off2 = p2 * genoma_len
+            var dst_off = out_idx * genoma_len
             stamp += 1
-            for i in range(GENOMA_LENGTH):
+            for i in range(genoma_len):
                 used_stamp[Int(pop_a[off1 + i])] = stamp
-            for i in range(GENOMA_LENGTH):
+            for i in range(genoma_len):
                 var g1 = pop_a[off1 + i]
                 var g2 = pop_a[off2 + i]
                 if used_stamp[Int(g2)] != stamp and rng.next_bit():
@@ -411,18 +439,21 @@ def run_ga(
     var final_span = Span(pop_a)
     var best_idx = 0
     var best_fit = 1e30
-    for g in range(GENERATION_LENGTH):
-        var off = g * GENOMA_LENGTH
+    for g in range(generation_length):
+        var off = g * genoma_len
         var f = compute_fitness(
-            final_span[off : off + GENOMA_LENGTH], caps_span
+            final_span[off : off + genoma_len],
+            caps_span,
+            group_sums,
+            config,
         )
         if f < best_fit:
             best_fit = f
             best_idx = g
 
-    var best_genoma = List[Int32](capacity=GENOMA_LENGTH)
-    var best_off = best_idx * GENOMA_LENGTH
-    for i in range(GENOMA_LENGTH):
+    var best_genoma = List[Int32](capacity=genoma_len)
+    var best_off = best_idx * genoma_len
+    for i in range(genoma_len):
         best_genoma.append(pop_a[best_off + i])
 
     var elapsed = perf_counter() - t0
@@ -436,68 +467,72 @@ def run_ga(
 
 def greedy_balanced_init(
     caps: List[Float64],
+    config: BankConfig,
     mut selected: List[Int32],
     mut unused: List[Int32],
-    mut group_sums: Array[Float64, NUM_GROUPS],
+    mut group_sums: List[Float64],
     mut rng: Rng,
     randomized: Bool,
 ):
-    """Initialize 18 groups of 9 capacitors via balanced LPT assignment."""
+    """Initialize num_groups x caps_per_group bank via balanced LPT assignment.
+    """
     var num_caps = len(caps)
+    var genoma_len = config.genoma_length
+    var num_groups = config.num_groups
+    var caps_per_group = config.caps_per_group
+
     var order = List[Int](capacity=num_caps)
     for i in range(num_caps):
         order.append(i)
 
     if randomized:
-        # Random subset of 162 capacitors, then sort descending for LPT packing
-        for i in range(GENOMA_LENGTH):
+        for i in range(genoma_len):
             var j = i + rng.next_int(num_caps - i)
             var tmp = order[i]
             order[i] = order[j]
             order[j] = tmp
     else:
-        # Sort all capacitors by capacitance and pick the middle 162 (tightest spread)
+
         def cmp_cap(a: Int, b: Int) {imm caps} -> Bool:
             return caps[a] < caps[b]
 
         sort(order, cmp_cap)
-        var start = (num_caps - GENOMA_LENGTH) // 2
+        var start = (num_caps - genoma_len) // 2
         var chosen = List[Int](capacity=num_caps)
-        for i in range(GENOMA_LENGTH):
+        for i in range(genoma_len):
             chosen.append(order[start + i])
         for i in range(start):
             chosen.append(order[i])
-        for i in range(start + GENOMA_LENGTH, num_caps):
+        for i in range(start + genoma_len, num_caps):
             chosen.append(order[i])
         order = chosen^
 
-    # Sort the chosen 162 indices descending by capacitance for LPT packing
-    var chosen_162 = List[Int](capacity=GENOMA_LENGTH)
-    for i in range(GENOMA_LENGTH):
-        chosen_162.append(order[i])
+    var chosen_set = List[Int](capacity=genoma_len)
+    for i in range(genoma_len):
+        chosen_set.append(order[i])
 
     def cmp_desc(a: Int, b: Int) {imm caps} -> Bool:
         return caps[a] > caps[b]
 
-    sort(chosen_162, cmp_desc)
+    sort(chosen_set, cmp_desc)
 
     unused.clear()
-    for i in range(GENOMA_LENGTH, num_caps):
+    for i in range(genoma_len, num_caps):
         unused.append(Int32(order[i]))
 
-    var counts = Array[Int, NUM_GROUPS](fill=0)
-    for g in range(NUM_GROUPS):
+    var counts = List[Int](length=num_groups, fill=0)
+    for g in range(num_groups):
         group_sums[g] = 0.0
 
-    for idx_pos in range(GENOMA_LENGTH):
-        var c_idx = chosen_162[idx_pos]
+    for idx_pos in range(genoma_len):
+        var c_idx = chosen_set[idx_pos]
         var best_g = -1
         var min_sum = 1e30
-        for g in range(NUM_GROUPS):
-            if counts[g] < CAPS_PER_GROUP and group_sums[g] < min_sum:
+        for g in range(num_groups):
+            if counts[g] < caps_per_group and group_sums[g] < min_sum:
                 min_sum = group_sums[g]
                 best_g = g
-        var slot = best_g * CAPS_PER_GROUP + counts[best_g]
+        var slot = best_g * caps_per_group + counts[best_g]
         selected[slot] = Int32(c_idx)
         counts[best_g] += 1
         group_sums[best_g] += caps[c_idx]
@@ -505,26 +540,26 @@ def greedy_balanced_init(
 
 def run_fast_solver(
     caps: List[Float64],
+    config: BankConfig,
     max_restarts: Int = 64,
     seed: UInt64 = 42,
     verbose: Bool = False,
 ) -> SolveResult:
-    """High-speed Mojo local search solver with O(1) incremental evaluation.
-
-    Combines greedy LPT initialization with exhaustive first-improvement 2-opt
-    inter-group swaps and unused-pool replacements, restarting on plateau until
-    reaching machine-precision balance (<= 1e-15) or max_restarts.
-    """
+    """High-speed Mojo local search solver with incremental evaluation."""
     var t0 = perf_counter()
     var num_caps = len(caps)
-    var num_unused = num_caps - GENOMA_LENGTH
+    var genoma_len = config.genoma_length
+    var num_groups = config.num_groups
+    var caps_per_group = config.caps_per_group
+    var num_unused = num_caps - genoma_len
     var rng = Rng(seed)
 
-    var selected = List[Int32](length=GENOMA_LENGTH, fill=Int32(0))
+    var selected = List[Int32](length=genoma_len, fill=Int32(0))
     var unused = List[Int32](capacity=num_unused)
-    var group_sums = Array[Float64, NUM_GROUPS](fill=0.0)
+    var group_sums = List[Float64](length=num_groups, fill=0.0)
+    var verify_sums = List[Float64](length=num_groups, fill=0.0)
 
-    var global_best_genoma = List[Int32](length=GENOMA_LENGTH, fill=Int32(0))
+    var global_best_genoma = List[Int32](length=genoma_len, fill=Int32(0))
     var global_best_fit = 1e30
     var sweeps_total = 0
 
@@ -533,64 +568,67 @@ def run_fast_solver(
     for restart in range(max_restarts):
         greedy_balanced_init(
             caps,
+            config,
             selected,
             unused,
             group_sums,
             rng,
             randomized=(restart > 0),
         )
-        var cur_fit = fitness_from_group_sums(group_sums)
+        var cur_fit = fitness_from_group_sums(Span(group_sums), config)
 
-        # Iterative local search (steepest / first-improvement sweeps)
         var improved = True
         while improved and cur_fit > TARGET_EPS:
             improved = False
             sweeps_total += 1
 
-            # 1. Pool replacement moves: replace selected[a] with unused[u]
-            for g in range(NUM_GROUPS):
-                var base_g = g * CAPS_PER_GROUP
-                for k in range(CAPS_PER_GROUP):
-                    var pos_a = base_g + k
-                    var c_a = Int(selected[pos_a])
-                    var cap_a = caps[c_a]
-                    var old_sum_g = group_sums[g]
+            # 1. Pool replacement moves
+            if num_unused > 0:
+                for g in range(num_groups):
+                    var base_g = g * caps_per_group
+                    for k in range(caps_per_group):
+                        var pos_a = base_g + k
+                        var c_a = Int(selected[pos_a])
+                        var cap_a = caps[c_a]
+                        var old_sum_g = group_sums[g]
 
-                    var best_u = -1
-                    var best_u_fit = cur_fit - 1e-18
+                        var best_u = -1
+                        var best_u_fit = cur_fit - 1e-18
 
-                    for u in range(num_unused):
-                        var c_u = Int(unused[u])
-                        var cap_u = caps[c_u]
-                        if cap_u == cap_a:
-                            continue
-                        group_sums[g] = old_sum_g - cap_a + cap_u
-                        var cand_fit = fitness_from_group_sums(group_sums)
-                        if cand_fit < best_u_fit:
-                            best_u_fit = cand_fit
-                            best_u = u
+                        for u in range(num_unused):
+                            var c_u = Int(unused[u])
+                            var cap_u = caps[c_u]
+                            if cap_u == cap_a:
+                                continue
+                            group_sums[g] = old_sum_g - cap_a + cap_u
+                            var cand_fit = fitness_from_group_sums(
+                                Span(group_sums), config
+                            )
+                            if cand_fit < best_u_fit:
+                                best_u_fit = cand_fit
+                                best_u = u
 
-                    if best_u >= 0:
-                        var c_u = Int(unused[best_u])
-                        group_sums[g] = old_sum_g - cap_a + caps[c_u]
-                        selected[pos_a] = Int32(c_u)
-                        unused[best_u] = Int32(c_a)
-                        cur_fit = best_u_fit
-                        improved = True
-                        if cur_fit <= TARGET_EPS:
-                            break
-                    else:
-                        group_sums[g] = old_sum_g
-                if cur_fit <= TARGET_EPS:
-                    break
+                        if best_u >= 0:
+                            var c_u = Int(unused[best_u])
+                            group_sums[g] = old_sum_g - cap_a + caps[c_u]
+                            selected[pos_a] = Int32(c_u)
+                            unused[best_u] = Int32(c_a)
+                            cur_fit = best_u_fit
+                            improved = True
+                            if cur_fit <= TARGET_EPS:
+                                break
+                        else:
+                            group_sums[g] = old_sum_g
+                    if cur_fit <= TARGET_EPS:
+                        break
 
             if cur_fit <= TARGET_EPS:
                 break
 
-            # 2. Inter-group 2-opt swaps: swap selected[pos_a] and selected[pos_b]
-            for g1 in range(NUM_GROUPS - 1):
-                var base1 = g1 * CAPS_PER_GROUP
-                for k1 in range(CAPS_PER_GROUP):
+            # 2. Inter-group 2-opt swaps
+            for g1 in range(num_groups - 1):
+                var base1 = g1 * caps_per_group
+                for k1 in range(caps_per_group):
                     var pos_a = base1 + k1
                     var c_a = Int(selected[pos_a])
                     var cap_a = caps[c_a]
@@ -600,10 +638,10 @@ def run_fast_solver(
                     var best_g2 = -1
                     var best_swap_fit = cur_fit - 1e-18
 
-                    for g2 in range(g1 + 1, NUM_GROUPS):
-                        var base2 = g2 * CAPS_PER_GROUP
+                    for g2 in range(g1 + 1, num_groups):
+                        var base2 = g2 * caps_per_group
                         var old_sum2 = group_sums[g2]
-                        for k2 in range(CAPS_PER_GROUP):
+                        for k2 in range(caps_per_group):
                             var pos_b = base2 + k2
                             var c_b = Int(selected[pos_b])
                             var cap_b = caps[c_b]
@@ -612,7 +650,9 @@ def run_fast_solver(
                                 continue
                             group_sums[g1] = old_sum1 + delta
                             group_sums[g2] = old_sum2 - delta
-                            var cand_fit = fitness_from_group_sums(group_sums)
+                            var cand_fit = fitness_from_group_sums(
+                                Span(group_sums), config
+                            )
                             if cand_fit < best_swap_fit:
                                 best_swap_fit = cand_fit
                                 best_pos_b = pos_b
@@ -635,11 +675,12 @@ def run_fast_solver(
                 if cur_fit <= TARGET_EPS:
                     break
 
-        # Recompute from scratch to avoid any accumulated float drift
-        var exact_fit = compute_fitness(Span(selected), Span(caps))
+        var exact_fit = compute_fitness(
+            Span(selected), Span(caps), verify_sums, config
+        )
         if exact_fit < global_best_fit:
             global_best_fit = exact_fit
-            for i in range(GENOMA_LENGTH):
+            for i in range(genoma_len):
                 global_best_genoma[i] = selected[i]
             if verbose:
                 print("restart", restart, "best fit ->", global_best_fit)
@@ -660,21 +701,23 @@ def save_results_csv(
     out_path: String,
     data: CapacitorData,
     genoma: List[Int32],
+    config: BankConfig,
 ) raises:
-    """Write the ordered 162-capacitor solution to CSV."""
+    """Write the ordered 3-phase (A, B, C) capacitor bank solution to CSV."""
+    var phase_names: Array[StaticString, NUM_PHASES] = ["A", "B", "C"]
     var lines = String(
         "position,phase,series_group,parallel_slot,db_idx,serial,capacitance,deviation\n"
     )
-    for pos in range(GENOMA_LENGTH):
+    for pos in range(config.genoma_length):
         var c = Int(genoma[pos])
-        var group = pos // CAPS_PER_GROUP
-        var phase = group // GROUPS_PER_PHASE
-        var series_group = group % GROUPS_PER_PHASE
-        var slot = pos % CAPS_PER_GROUP
+        var group = pos // config.caps_per_group
+        var phase = group // config.groups_per_phase
+        var series_group = group % config.groups_per_phase
+        var slot = pos % config.caps_per_group
         lines += (
             String(pos)
             + ","
-            + String(phase)
+            + String(phase_names[phase])
             + ","
             + String(series_group)
             + ","
@@ -698,6 +741,10 @@ def main() raises:
     var mode = String("fast")
     var db_path = String("src/capacitor_balance/capacitors.db")
     var out_path = String("mojo_solver/mojo_results.csv")
+    var series = DEFAULT_SERIES
+    var parallel = DEFAULT_PARALLEL
+    var iterations = DEFAULT_ITERATIONS
+    var generation_length = DEFAULT_GENERATION_LENGTH
     var seed: UInt64 = 42
     var verbose = False
 
@@ -706,6 +753,18 @@ def main() raises:
         var arg = String(args[i])
         if arg == "--mode" and i + 1 < len(args):
             mode = String(args[i + 1])
+            i += 2
+        elif arg == "--series" and i + 1 < len(args):
+            series = Int(String(args[i + 1]))
+            i += 2
+        elif arg == "--parallel" and i + 1 < len(args):
+            parallel = Int(String(args[i + 1]))
+            i += 2
+        elif arg == "--iterations" and i + 1 < len(args):
+            iterations = Int(String(args[i + 1]))
+            i += 2
+        elif arg == "--generation-length" and i + 1 < len(args):
+            generation_length = Int(String(args[i + 1]))
             i += 2
         elif arg == "--db" and i + 1 < len(args):
             db_path = String(args[i + 1])
@@ -722,21 +781,47 @@ def main() raises:
         else:
             i += 1
 
+    if series < 1 or parallel < 1:
+        raise Error("Both --series and --parallel must be >= 1")
+
+    var config = BankConfig(series, parallel)
     var wall_t0 = perf_counter()
     var data = load_capacitors(db_path)
 
+    if config.genoma_length > len(data.caps):
+        raise Error(
+            "Requested 3 * "
+            + String(series)
+            + " * "
+            + String(parallel)
+            + " = "
+            + String(config.genoma_length)
+            + " capacitors, but database only has "
+            + String(len(data.caps))
+            + " valid rows"
+        )
+
     var result: SolveResult
     if mode == "ga":
-        result = run_ga(data.caps, ITERATIONS, seed, verbose)
+        result = run_ga(
+            data.caps, config, generation_length, iterations, seed, verbose
+        )
     else:
-        result = run_fast_solver(data.caps, 64, seed, verbose)
+        result = run_fast_solver(data.caps, config, 64, seed, verbose)
 
-    save_results_csv(out_path, data, result.best_genoma)
+    save_results_csv(out_path, data, result.best_genoma, config)
     var wall_elapsed = perf_counter() - wall_t0
 
     print(
         "mode="
         + mode
+        + " bank=3x"
+        + String(series)
+        + "x"
+        + String(parallel)
+        + "("
+        + String(config.genoma_length)
+        + ")"
         + " best_fit="
         + String(result.best_fitness)
         + " solve_s="

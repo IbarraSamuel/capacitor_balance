@@ -1,29 +1,11 @@
 """Alternative ultra-fast Mojo solver for 3-phase (A, B, C) Capacitor Balance.
 
+Supports arbitrary 3-phase bank sizes via `--series` (series groups per phase)
+and `--parallel` (capacitors in parallel per group), always using 3 phases
+(total bank size = 3 * series * parallel).
+
 Algorithm: Tightest-Window Snake/LPT Construction + Targeted Residual Balancing
-+ Phase-Reciprocal Assignment (zero-allocation, sub-millisecond).
-
-Instead of stochastic population evolution (GA) or exhaustive O(N*M + N^2)
-neighborhood scans, this solver exploits the additive/reciprocal structure of
-a 3-phase series-parallel capacitor bank directly:
-
-1. **Tightest-Window Selection**: Sorts the valid capacitors once and picks the
-   contiguous 162-unit window with minimum spread (densest cluster around the
-   nominal/modal capacitance).
-2. **Snake + LPT Packing**: Assigns the first 8 parallel layers (144 units) in
-   alternating boustrophedon order (pairing high & low in O(1)) and packs the
-   final 9th layer inversely against the sorted partial sums.
-3. **O(1) Max-Min Group Cancellation & O(log M) Binary-Search Pool Matching**:
-   Repeatedly picks the heaviest (g_max) and lightest (g_min) parallel groups
-   and applies either:
-   - Exact algebraic 2-opt transfer between g_max and g_min (at most 81 pairs,
-     minimizing |delta - (P_max - P_min) / 2| with zero sqrt calls), or
-   - Binary-searched pool replacement on the sorted unused pool to pull g_max
-     or g_min directly onto the target group capacitance P_target.
-4. **Phase A/B/C Reciprocal Balancing**: Assigns the 18 parallel groups to
-   phases A, B, and C (6 groups per phase) to equalize reciprocal sums
-   sum(1 / P_g), minimizing the 20x-weighted phase unbalance even on arbitrary
-   continuous capacitance datasets.
++ Phase-Reciprocal Assignment (sub-millisecond).
 """
 
 from std.ffi import OwnedDLHandle, c_int
@@ -32,11 +14,24 @@ from std.sys import CompilationTarget, argv
 from std.time import perf_counter, perf_counter_ns
 
 comptime NUM_PHASES = 3
-comptime GROUPS_PER_PHASE = 6
-comptime CAPS_PER_GROUP = 9
-comptime NUM_GROUPS = NUM_PHASES * GROUPS_PER_PHASE  # 18
-comptime GENOMA_LENGTH = NUM_GROUPS * CAPS_PER_GROUP  # 162
+comptime DEFAULT_SERIES = 6
+comptime DEFAULT_PARALLEL = 9
 comptime TARGET_EPS = 1e-15
+
+
+struct BankConfig(TrivialRegisterPassable):
+    """3-phase (A, B, C) series-parallel capacitor bank dimensions."""
+
+    var groups_per_phase: Int
+    var caps_per_group: Int
+    var num_groups: Int
+    var genoma_length: Int
+
+    def __init__(out self, groups_per_phase: Int, caps_per_group: Int):
+        self.groups_per_phase = groups_per_phase
+        self.caps_per_group = caps_per_group
+        self.num_groups = NUM_PHASES * groups_per_phase
+        self.genoma_length = self.num_groups * caps_per_group
 
 
 @fieldwise_init
@@ -146,38 +141,41 @@ def load_capacitors(db_path: String) raises -> CapacitorData:
 def evaluate_exact(
     genoma: Span[Int32, _],
     caps: Span[Float64, _],
+    config: BankConfig,
 ) -> Tuple[Float64, Float64, Float64]:
     """Compute exact (fitness, par_std, phase_std) using two-pass SIMD-4."""
-    var group_sums = Array[Float64, NUM_GROUPS](fill=0.0)
-    comptime for g in range(NUM_GROUPS):
-        var base = g * CAPS_PER_GROUP
-        group_sums[g] = (
-            caps[Int(genoma[base])]
-            + caps[Int(genoma[base + 1])]
-            + caps[Int(genoma[base + 2])]
-            + caps[Int(genoma[base + 3])]
-            + caps[Int(genoma[base + 4])]
-            + caps[Int(genoma[base + 5])]
-            + caps[Int(genoma[base + 6])]
-            + caps[Int(genoma[base + 7])]
-            + caps[Int(genoma[base + 8])]
-        )
+    var num_groups = config.num_groups
+    var groups_per_phase = config.groups_per_phase
+    var caps_per_group = config.caps_per_group
+
+    var group_sums = List[Float64](length=num_groups, fill=0.0)
+    for g in range(num_groups):
+        var base = g * caps_per_group
+        var s = 0.0
+        for k in range(caps_per_group):
+            s += caps[Int(genoma[base + k])]
+        group_sums[g] = s
 
     var sum_vec = SIMD[.float64, 4](0.0)
-    comptime for g in range(0, 16, 4):
+    var g = 0
+    while g + 4 <= num_groups:
         sum_vec += SIMD[.float64, 4](
             group_sums[g],
             group_sums[g + 1],
             group_sums[g + 2],
             group_sums[g + 3],
         )
-    var par_mean = (
-        sum_vec.reduce_add() + group_sums[16] + group_sums[17]
-    ) / Float64(NUM_GROUPS)
+        g += 4
+    var par_sum = sum_vec.reduce_add()
+    while g < num_groups:
+        par_sum += group_sums[g]
+        g += 1
+    var par_mean = par_sum / Float64(num_groups)
 
     var mean_vec = SIMD[.float64, 4](par_mean)
     var sq_vec = SIMD[.float64, 4](0.0)
-    comptime for g in range(0, 16, 4):
+    g = 0
+    while g + 4 <= num_groups:
         var d = (
             SIMD[.float64, 4](
                 group_sums[g],
@@ -188,27 +186,33 @@ def evaluate_exact(
             - mean_vec
         )
         sq_vec += d * d
-    var d16 = group_sums[16] - par_mean
-    var d17 = group_sums[17] - par_mean
-    var par_var = (sq_vec.reduce_add() + d16 * d16 + d17 * d17) / Float64(
-        NUM_GROUPS - 1
-    )
+        g += 4
+    var par_sq = sq_vec.reduce_add()
+    while g < num_groups:
+        var d = group_sums[g] - par_mean
+        par_sq += d * d
+        g += 1
+    var par_var = par_sq / Float64(num_groups - 1)
     var par_std = sqrt(par_var) if par_var > 0.0 else 0.0
 
     var phase_caps = Array[Float64, NUM_PHASES](fill=0.0)
     comptime for p in range(NUM_PHASES):
-        var base = p * GROUPS_PER_PHASE
-        var v4 = SIMD[.float64, 4](
-            group_sums[base],
-            group_sums[base + 1],
-            group_sums[base + 2],
-            group_sums[base + 3],
-        )
-        var inv_sum = (
-            (SIMD[.float64, 4](1.0) / v4).reduce_add()
-            + 1.0 / group_sums[base + 4]
-            + 1.0 / group_sums[base + 5]
-        )
+        var base = p * groups_per_phase
+        var inv_vec = SIMD[.float64, 4](0.0)
+        var s = 0
+        while s + 4 <= groups_per_phase:
+            var v4 = SIMD[.float64, 4](
+                group_sums[base + s],
+                group_sums[base + s + 1],
+                group_sums[base + s + 2],
+                group_sums[base + s + 3],
+            )
+            inv_vec += SIMD[.float64, 4](1.0) / v4
+            s += 4
+        var inv_sum = inv_vec.reduce_add()
+        while s < groups_per_phase:
+            inv_sum += 1.0 / group_sums[base + s]
+            s += 1
         phase_caps[p] = 1.0 / inv_sum
 
     var phase_mean = (phase_caps[0] + phase_caps[1] + phase_caps[2]) / 3.0
@@ -252,11 +256,9 @@ def replace_in_sorted_unused(
     var n = len(unused)
     var new_val = caps[Int(new_cap_idx)]
     var i = pos
-    # Bubble right if new_val is larger than next element
     while i + 1 < n and caps[Int(unused[i + 1])] < new_val:
         unused[i] = unused[i + 1]
         i += 1
-    # Bubble left if new_val is smaller than previous element
     while i > 0 and caps[Int(unused[i - 1])] > new_val:
         unused[i] = unused[i - 1]
         i -= 1
@@ -265,19 +267,17 @@ def replace_in_sorted_unused(
 
 def balance_phases_by_reciprocal(
     mut genoma: List[Int32],
-    mut group_sums: Array[Float64, NUM_GROUPS],
+    mut group_sums: List[Float64],
+    config: BankConfig,
 ):
-    """Assign the 18 parallel groups across Phases A, B, C to equalize 1/S_p.
+    """Assign parallel groups across Phases A, B, C to equalize 1 / S_p."""
+    var num_groups = config.num_groups
+    var groups_per_phase = config.groups_per_phase
+    var caps_per_group = config.caps_per_group
 
-    When parallel group sums have any non-zero residual differences (e.g. on
-    arbitrary continuous measurements), arranging the 18 groups into 3 phases
-    of 6 groups using LPT + 2-opt on inv_p = 1 / P_g minimizes the 20x-weighted
-    phase unbalance without altering any parallel group sum.
-    """
-    # Compute 1 / P_g for each group and sort group indices descending by 1 / P_g
-    var inv_g = Array[Float64, NUM_GROUPS](fill=0.0)
-    var g_order = List[Int](capacity=NUM_GROUPS)
-    for g in range(NUM_GROUPS):
+    var inv_g = List[Float64](length=num_groups, fill=0.0)
+    var g_order = List[Int](capacity=num_groups)
+    for g in range(num_groups):
         inv_g[g] = 1.0 / group_sums[g]
         g_order.append(g)
 
@@ -286,24 +286,22 @@ def balance_phases_by_reciprocal(
 
     sort(g_order, cmp_inv_desc)
 
-    # Greedy LPT assignment of 18 groups into 3 phases (6 per phase)
-    var phase_groups = Array[Int, NUM_GROUPS](fill=0)
+    var phase_groups = List[Int](length=num_groups, fill=0)
     var phase_counts = Array[Int, NUM_PHASES](fill=0)
     var phase_inv = Array[Float64, NUM_PHASES](fill=0.0)
 
-    for idx in range(NUM_GROUPS):
+    for idx in range(num_groups):
         var g = g_order[idx]
         var best_p = -1
         var min_inv = 1e30
         for p in range(NUM_PHASES):
-            if phase_counts[p] < GROUPS_PER_PHASE and phase_inv[p] < min_inv:
+            if phase_counts[p] < groups_per_phase and phase_inv[p] < min_inv:
                 min_inv = phase_inv[p]
                 best_p = p
-        phase_groups[best_p * GROUPS_PER_PHASE + phase_counts[best_p]] = g
+        phase_groups[best_p * groups_per_phase + phase_counts[best_p]] = g
         phase_counts[best_p] += 1
         phase_inv[best_p] += inv_g[g]
 
-    # Exact 2-opt swaps between phases to further reduce reciprocal spread
     var improved = True
     while improved:
         improved = False
@@ -321,10 +319,10 @@ def balance_phases_by_reciprocal(
         var best_s1 = -1
         var best_s2 = -1
         var best_err = ideal - 1e-18
-        for s1 in range(GROUPS_PER_PHASE):
-            var g1 = phase_groups[p_max * GROUPS_PER_PHASE + s1]
-            for s2 in range(GROUPS_PER_PHASE):
-                var g2 = phase_groups[p_min * GROUPS_PER_PHASE + s2]
+        for s1 in range(groups_per_phase):
+            var g1 = phase_groups[p_max * groups_per_phase + s1]
+            for s2 in range(groups_per_phase):
+                var g2 = phase_groups[p_min * groups_per_phase + s2]
                 var delta = inv_g[g1] - inv_g[g2]
                 if delta > 0.0 and delta < gap:
                     var err = abs(delta - ideal)
@@ -333,8 +331,8 @@ def balance_phases_by_reciprocal(
                         best_s1 = s1
                         best_s2 = s2
         if best_s1 >= 0:
-            var idx1 = p_max * GROUPS_PER_PHASE + best_s1
-            var idx2 = p_min * GROUPS_PER_PHASE + best_s2
+            var idx1 = p_max * groups_per_phase + best_s1
+            var idx2 = p_min * groups_per_phase + best_s2
             var g1 = phase_groups[idx1]
             var g2 = phase_groups[idx2]
             var delta = inv_g[g1] - inv_g[g2]
@@ -344,24 +342,29 @@ def balance_phases_by_reciprocal(
             phase_inv[p_min] += delta
             improved = True
 
-    # Reorder genoma and group_sums according to phase_groups
-    var reordered = List[Int32](length=GENOMA_LENGTH, fill=Int32(0))
-    var new_sums = Array[Float64, NUM_GROUPS](fill=0.0)
-    for new_g in range(NUM_GROUPS):
+    var reordered = List[Int32](length=config.genoma_length, fill=Int32(0))
+    var new_sums = List[Float64](length=num_groups, fill=0.0)
+    for new_g in range(num_groups):
         var old_g = phase_groups[new_g]
         new_sums[new_g] = group_sums[old_g]
-        var src = old_g * CAPS_PER_GROUP
-        var dst = new_g * CAPS_PER_GROUP
-        for k in range(CAPS_PER_GROUP):
+        var src = old_g * caps_per_group
+        var dst = new_g * caps_per_group
+        for k in range(caps_per_group):
             reordered[dst + k] = genoma[src + k]
     genoma = reordered^
     group_sums = new_sums^
 
 
-def solve_residual_balance(caps: List[Float64]) -> BalanceResult:
+def solve_residual_balance(
+    caps: List[Float64],
+    config: BankConfig,
+) -> BalanceResult:
     """Solve 3-phase capacitor balance via targeted residual matching."""
     var t0_ns = perf_counter_ns()
     var num_caps = len(caps)
+    var num_groups = config.num_groups
+    var caps_per_group = config.caps_per_group
+    var genoma_len = config.genoma_length
     var caps_span = Span(caps)
 
     # 1. Sort all valid capacitor indices by ascending capacitance: O(N log N)
@@ -374,70 +377,69 @@ def solve_residual_balance(caps: List[Float64]) -> BalanceResult:
 
     sort(sorted_all, cmp_asc)
 
-    # 2. Pick the contiguous 162-unit window with minimum capacitance spread
+    # 2. Pick the contiguous genoma_len-unit window with minimum spread
     var best_start = 0
     var best_range = 1e30
-    var max_start = num_caps - GENOMA_LENGTH
+    var max_start = num_caps - genoma_len
     for s in range(max_start + 1):
-        var r = caps[sorted_all[s + GENOMA_LENGTH - 1]] - caps[sorted_all[s]]
+        var r = caps[sorted_all[s + genoma_len - 1]] - caps[sorted_all[s]]
         if r < best_range:
             best_range = r
             best_start = s
 
-    # Partition into sorted chosen[162] and sorted unused[N - 162]
-    var chosen = List[Int32](capacity=GENOMA_LENGTH)
-    var unused = List[Int32](capacity=num_caps - GENOMA_LENGTH)
+    # Partition into sorted chosen[genoma_len] and sorted unused[N - genoma_len]
+    var chosen = List[Int32](capacity=genoma_len)
+    var unused = List[Int32](capacity=num_caps - genoma_len)
     for i in range(best_start):
         unused.append(Int32(sorted_all[i]))
-    for i in range(best_start, best_start + GENOMA_LENGTH):
+    for i in range(best_start, best_start + genoma_len):
         chosen.append(Int32(sorted_all[i]))
-    for i in range(best_start + GENOMA_LENGTH, num_caps):
+    for i in range(best_start + genoma_len, num_caps):
         unused.append(Int32(sorted_all[i]))
 
-    # 3. Snake (boustrophedon) assignment for first 8 layers + LPT for 9th layer
-    var genoma = List[Int32](length=GENOMA_LENGTH, fill=Int32(0))
-    var group_sums = Array[Float64, NUM_GROUPS](fill=0.0)
+    # 3. Snake assignment for first (caps_per_group - 1) layers + LPT for final layer
+    var genoma = List[Int32](length=genoma_len, fill=Int32(0))
+    var group_sums = List[Float64](length=num_groups, fill=0.0)
 
-    for layer in range(CAPS_PER_GROUP - 1):
-        var base_idx = layer * NUM_GROUPS
+    for layer in range(caps_per_group - 1):
+        var base_idx = layer * num_groups
         if (layer & 1) == 0:
-            for g in range(NUM_GROUPS):
+            for g in range(num_groups):
                 var c = chosen[base_idx + g]
-                genoma[g * CAPS_PER_GROUP + layer] = c
+                genoma[g * caps_per_group + layer] = c
                 group_sums[g] += caps[Int(c)]
         else:
-            for g in range(NUM_GROUPS):
-                var c = chosen[base_idx + (NUM_GROUPS - 1 - g)]
-                genoma[g * CAPS_PER_GROUP + layer] = c
+            for g in range(num_groups):
+                var c = chosen[base_idx + (num_groups - 1 - g)]
+                genoma[g * caps_per_group + layer] = c
                 group_sums[g] += caps[Int(c)]
 
-    # Final 9th layer: sort groups by ascending partial sum, assign largest caps
-    var g_order = List[Int](capacity=NUM_GROUPS)
-    for g in range(NUM_GROUPS):
+    var g_order = List[Int](capacity=num_groups)
+    for g in range(num_groups):
         g_order.append(g)
 
     def cmp_gsum(a: Int, b: Int) {imm group_sums} -> Bool:
         return group_sums[a] < group_sums[b]
 
     sort(g_order, cmp_gsum)
-    var last_base = (CAPS_PER_GROUP - 1) * NUM_GROUPS
-    for rank in range(NUM_GROUPS):
+    var last_base = (caps_per_group - 1) * num_groups
+    for rank in range(num_groups):
         var g = g_order[rank]
-        var c = chosen[last_base + (NUM_GROUPS - 1 - rank)]
-        genoma[g * CAPS_PER_GROUP + (CAPS_PER_GROUP - 1)] = c
+        var c = chosen[last_base + (num_groups - 1 - rank)]
+        genoma[g * caps_per_group + (caps_per_group - 1)] = c
         group_sums[g] += caps[Int(c)]
 
     # 4. Targeted Residual Balancing Loop (Max-Min Cancel + Binary-Search Pool)
     var moves = 0
     var num_unused = len(unused)
     var max_moves = 2000
+    var sse_factor = 1.0 - 1.0 / Float64(num_groups)
 
     while moves < max_moves:
-        # Find heaviest (g_max) and lightest (g_min) groups & total sum
         var g_max = 0
         var g_min = 0
         var total_sum = group_sums[0]
-        for g in range(1, NUM_GROUPS):
+        for g in range(1, num_groups):
             var s = group_sums[g]
             total_sum += s
             if s > group_sums[g_max]:
@@ -449,19 +451,18 @@ def solve_residual_balance(caps: List[Float64]) -> BalanceResult:
         if gap <= TARGET_EPS:
             break
 
-        var target = total_sum / Float64(NUM_GROUPS)
+        var target = total_sum / Float64(num_groups)
 
-        # 4a. Try O(1) max-min 2-opt cancellation (at most 81 pairs, zero sqrt!)
-        # Swapping a in g_max with b in g_min changes SSE by 2*d*(d - gap).
+        # 4a. Algebraic max-min 2-opt cancellation
         var best_k1 = -1
         var best_k2 = -1
         var best_delta_sse = -1e-18
-        var base_max = g_max * CAPS_PER_GROUP
-        var base_min = g_min * CAPS_PER_GROUP
+        var base_max = g_max * caps_per_group
+        var base_min = g_min * caps_per_group
 
-        for k1 in range(CAPS_PER_GROUP):
+        for k1 in range(caps_per_group):
             var c_a = caps[Int(genoma[base_max + k1])]
-            for k2 in range(CAPS_PER_GROUP):
+            for k2 in range(caps_per_group):
                 var d = c_a - caps[Int(genoma[base_min + k2])]
                 if d > 0.0 and d < gap:
                     var d_sse = 2.0 * d * (d - gap)
@@ -470,45 +471,37 @@ def solve_residual_balance(caps: List[Float64]) -> BalanceResult:
                         best_k1 = k1
                         best_k2 = k2
 
-        # 4b. Try O(log M) binary-searched pool replacement on g_max and g_min
-        # Replacing c_old in group g by c_new changes sum_g by d = c_new - c_old.
-        # Exact change in SSE = sum((P_i - mean)^2):
-        #   d_sse = d * (2 * (P_g - target) + d * (1 - 1/NUM_GROUPS))
+        # 4b. O(log M) binary-searched pool replacement on g_max and g_min
         var best_pool_g = -1
         var best_pool_k = -1
         var best_pool_u = -1
         var best_pool_sse = best_delta_sse
-        comptime SSE_FACTOR = 1.0 - 1.0 / Float64(NUM_GROUPS)
 
         if num_unused > 0:
-            # Check both g_max (needs smaller cap) and g_min (needs larger cap)
             var cand_groups: Array[Int, 2] = [g_max, g_min]
             for cg_i in range(2):
                 var g = cand_groups[cg_i]
                 var resid = group_sums[g] - target
-                var base_g = g * CAPS_PER_GROUP
-                # Ideal d to zero out residual: d_ideal = -resid / SSE_FACTOR
-                var d_ideal = -resid / SSE_FACTOR
-                for k in range(CAPS_PER_GROUP):
+                var base_g = g * caps_per_group
+                var d_ideal = -resid / sse_factor
+                for k in range(caps_per_group):
                     var c_old = caps[Int(genoma[base_g + k])]
                     var want = c_old + d_ideal
                     var lb = lower_bound_unused(unused, caps_span, want)
-                    # Inspect lb and lb - 1 (nearest two values in sorted pool)
                     for probe in range(lb - 1, lb + 1):
                         if probe >= 0 and probe < num_unused:
                             var c_new = caps[Int(unused[probe])]
                             var d = c_new - c_old
                             if d != 0.0:
-                                var d_sse = d * (2.0 * resid + d * SSE_FACTOR)
+                                var d_sse = d * (2.0 * resid + d * sse_factor)
                                 if d_sse < best_pool_sse:
                                     best_pool_sse = d_sse
                                     best_pool_g = g
                                     best_pool_k = k
                                     best_pool_u = probe
 
-        # Commit whichever move achieved the greatest SSE reduction
         if best_pool_g >= 0:
-            var slot = best_pool_g * CAPS_PER_GROUP + best_pool_k
+            var slot = best_pool_g * caps_per_group + best_pool_k
             var old_idx = genoma[slot]
             var new_idx = unused[best_pool_u]
             group_sums[best_pool_g] += caps[Int(new_idx)] - caps[Int(old_idx)]
@@ -526,10 +519,8 @@ def solve_residual_balance(caps: List[Float64]) -> BalanceResult:
             group_sums[g_max] -= d
             group_sums[g_min] += d
             moves += 1
-        else:
-            # 4c. Fallback: try pulling any non-target group onto the modal
-            # group sum via binary-searched pool replacement (handles integer
-            # residual quantization when mean lies between discrete sums)
+        elif num_unused > 0:
+            # 4c. Fallback: pull non-target groups onto the modal group sum
             var modal_target = group_sums[g_max]
             if abs(group_sums[g_min] - target) < abs(
                 group_sums[g_max] - target
@@ -537,12 +528,12 @@ def solve_residual_balance(caps: List[Float64]) -> BalanceResult:
                 modal_target = group_sums[g_min]
 
             var found_fallback = False
-            for g in range(NUM_GROUPS):
+            for g in range(num_groups):
                 var need = modal_target - group_sums[g]
                 if abs(need) <= TARGET_EPS:
                     continue
-                var base_g = g * CAPS_PER_GROUP
-                for k in range(CAPS_PER_GROUP):
+                var base_g = g * caps_per_group
+                for k in range(caps_per_group):
                     var c_old = caps[Int(genoma[base_g + k])]
                     var want = c_old + need
                     var lb = lower_bound_unused(unused, caps_span, want)
@@ -570,21 +561,22 @@ def solve_residual_balance(caps: List[Float64]) -> BalanceResult:
                     break
             if not found_fallback:
                 break
+        else:
+            break
 
-    # 5. If any group spread remains, arrange the 18 groups across Phases A/B/C
-    # to minimize the 20x-weighted series phase unbalance
+    # 5. Arrange parallel groups across Phases A, B, C if any spread remains
     var min_g = group_sums[0]
     var max_g = group_sums[0]
-    for g in range(1, NUM_GROUPS):
+    for g in range(1, num_groups):
         if group_sums[g] < min_g:
             min_g = group_sums[g]
         if group_sums[g] > max_g:
             max_g = group_sums[g]
     if max_g - min_g > TARGET_EPS:
-        balance_phases_by_reciprocal(genoma, group_sums)
+        balance_phases_by_reciprocal(genoma, group_sums, config)
 
     # 6. Compute exact drift-free fitness from scratch
-    var metrics = evaluate_exact(Span(genoma), caps_span)
+    var metrics = evaluate_exact(Span(genoma), caps_span, config)
     var solve_ns = perf_counter_ns() - t0_ns
     return BalanceResult(
         genoma=genoma^,
@@ -600,18 +592,19 @@ def save_results_csv(
     out_path: String,
     data: CapacitorData,
     genoma: List[Int32],
+    config: BankConfig,
 ) raises:
-    """Write the ordered 162-capacitor 3-phase (A, B, C) solution to CSV."""
+    """Write the ordered 3-phase (A, B, C) capacitor bank solution to CSV."""
     var phase_names: Array[StaticString, NUM_PHASES] = ["A", "B", "C"]
     var lines = String(
         "position,phase,series_group,parallel_slot,db_idx,serial,capacitance,deviation\n"
     )
-    for pos in range(GENOMA_LENGTH):
+    for pos in range(config.genoma_length):
         var c = Int(genoma[pos])
-        var group = pos // CAPS_PER_GROUP
-        var phase = group // GROUPS_PER_PHASE
-        var series_group = group % GROUPS_PER_PHASE
-        var slot = pos % CAPS_PER_GROUP
+        var group = pos // config.caps_per_group
+        var phase = group // config.groups_per_phase
+        var series_group = group % config.groups_per_phase
+        var slot = pos % config.caps_per_group
         lines += (
             String(pos)
             + ","
@@ -638,12 +631,20 @@ def main() raises:
     var args = argv()
     var db_path = String("src/capacitor_balance/capacitors.db")
     var out_path = String("mojo_solver/residual_results.csv")
+    var series = DEFAULT_SERIES
+    var parallel = DEFAULT_PARALLEL
     var bench_iters = 1
 
     var i = 1
     while i < len(args):
         var arg = String(args[i])
-        if arg == "--db" and i + 1 < len(args):
+        if arg == "--series" and i + 1 < len(args):
+            series = Int(String(args[i + 1]))
+            i += 2
+        elif arg == "--parallel" and i + 1 < len(args):
+            parallel = Int(String(args[i + 1]))
+            i += 2
+        elif arg == "--db" and i + 1 < len(args):
             db_path = String(args[i + 1])
             i += 2
         elif arg == "--out" and i + 1 < len(args):
@@ -655,15 +656,32 @@ def main() raises:
         else:
             i += 1
 
+    if series < 1 or parallel < 1:
+        raise Error("Both --series and --parallel must be >= 1")
+
+    var config = BankConfig(series, parallel)
     var wall_t0 = perf_counter()
     var data = load_capacitors(db_path)
 
-    var result = solve_residual_balance(data.caps)
+    if config.genoma_length > len(data.caps):
+        raise Error(
+            "Requested 3 * "
+            + String(series)
+            + " * "
+            + String(parallel)
+            + " = "
+            + String(config.genoma_length)
+            + " capacitors, but database only has "
+            + String(len(data.caps))
+            + " valid rows"
+        )
+
+    var result = solve_residual_balance(data.caps, config)
     if bench_iters > 1:
         var best_ns = result.solve_ns
         var sum_ns = result.solve_ns
         for _ in range(1, bench_iters):
-            var r = solve_residual_balance(data.caps)
+            var r = solve_residual_balance(data.caps, config)
             sum_ns += r.solve_ns
             if r.solve_ns < best_ns:
                 best_ns = r.solve_ns
@@ -677,11 +695,18 @@ def main() raises:
             + String(Float64(best_ns) / 1000.0)
         )
 
-    save_results_csv(out_path, data, result.genoma)
+    save_results_csv(out_path, data, result.genoma, config)
     var wall_elapsed = perf_counter() - wall_t0
 
     print(
         "mode=residual"
+        + " bank=3x"
+        + String(series)
+        + "x"
+        + String(parallel)
+        + "("
+        + String(config.genoma_length)
+        + ")"
         + " best_fit="
         + String(result.fitness)
         + " par_std="

@@ -1,5 +1,6 @@
 """Async solver for Capacitor balance."""
 
+import argparse
 import asyncio
 import operator
 import random
@@ -10,6 +11,10 @@ from sqlite3 import connect
 from typing import TypedDict, cast
 
 import polars as pl
+
+NUM_PHASES = 3
+DEFAULT_SERIES = 6
+DEFAULT_PARALLEL = 9
 
 
 class Capacitor(TypedDict):
@@ -49,11 +54,18 @@ def generation_hash(gen: Generation) -> str:
     return str(pl.DataFrame(gen).get_column("serial").str.join()[0])
 
 
-async def evaluate_generation(generation: Generation) -> list[float]:
+async def evaluate_generation(
+    generation: Generation,
+    *,
+    series: int = DEFAULT_SERIES,
+    parallel: int = DEFAULT_PARALLEL,
+) -> list[float]:
     """Compute fitness for every genoma in a generation in parallel using Polars.
 
     Args:
         generation: List of genomas to evaluate.
+        series: Number of series-connected parallel groups per phase.
+        parallel: Number of capacitors in parallel per group.
 
     Returns:
         Fitness score for each genoma, in the same order.
@@ -62,7 +74,7 @@ async def evaluate_generation(generation: Generation) -> list[float]:
     lazy_batch = pl.LazyFrame(
         {
             "gen_id": [i for i in range(len(generation)) for _ in range(gen_len)],
-            "par_id": [j // 9 for _ in generation for j in range(gen_len)],
+            "par_id": [j // parallel for _ in generation for j in range(gen_len)],
             "cap": [cap["cap"] for gen in generation for cap in gen],
         }
     )
@@ -71,7 +83,7 @@ async def evaluate_generation(generation: Generation) -> list[float]:
         lazy_batch.group_by("gen_id", "par_id", maintain_order=True)
         .agg(pl.sum("cap"))
         .with_columns(pl.col("cap").std().over("gen_id").alias("par_std"))
-        .with_columns((pl.int_range(pl.len()).over("gen_id") // 6).alias("ser_id"))
+        .with_columns((pl.int_range(pl.len()).over("gen_id") // series).alias("ser_id"))
         .group_by("gen_id", "par_std", "ser_id", maintain_order=True)
         .agg((1 / (1 / pl.col("cap")).sum()).alias("cap"))
         .group_by("gen_id", maintain_order=True)
@@ -81,8 +93,13 @@ async def evaluate_generation(generation: Generation) -> list[float]:
     return [float(val) for val in result_df["std"].to_list()]
 
 
-async def sort_generation(generation: Generation) -> tuple[Generation, float]:
-    scores = await evaluate_generation(generation)
+async def sort_generation(
+    generation: Generation,
+    *,
+    series: int = DEFAULT_SERIES,
+    parallel: int = DEFAULT_PARALLEL,
+) -> tuple[Generation, float]:
+    scores = await evaluate_generation(generation, series=series, parallel=parallel)
     scored = sorted(
         zip(scores, generation, strict=True),
         key=operator.itemgetter(0),
@@ -192,6 +209,8 @@ async def update_generation(  # ruff: ignore[too-many-arguments]
     past_generation: Generation,
     capacitor_options: list[Capacitor],
     *,
+    series: int = DEFAULT_SERIES,
+    parallel: int = DEFAULT_PARALLEL,
     genoma_len: int,
     top_len: int,
     rand_len: int,
@@ -199,7 +218,9 @@ async def update_generation(  # ruff: ignore[too-many-arguments]
     mut_len: int,
     shuff_len: int,
 ) -> Generation:
-    sorted_generation, best = await sort_generation(past_generation)
+    sorted_generation, best = await sort_generation(
+        past_generation, series=series, parallel=parallel
+    )
     top_genomas = sorted_generation[:top_len]
     print(f"best fit -> {best}")  # ruff: ignore[print]
 
@@ -225,8 +246,8 @@ MAIN_FOLDER = Path(__file__).parent
 DB_FILE = MAIN_FOLDER / "capacitors.db"
 RESULT_FILE = MAIN_FOLDER / "parallel_results.xlsx"
 
-# Genoma
-GENOMA_LENGTH = 3 * 6 * 9
+# Default Genoma & GA sizes (3 phases fixed; series & parallel configurable)
+GENOMA_LENGTH = NUM_PHASES * DEFAULT_SERIES * DEFAULT_PARALLEL
 GENERATION_LENGTH = 1000
 ITERATIONS = 500
 # Generation Distribution
@@ -246,10 +267,76 @@ assert (  # ruff: ignore[assert]
 )
 
 
-async def main() -> None:
-    # Folders
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Balance a 3-phase (A, B, C) series-parallel capacitor bank."
+    )
+    parser.add_argument(
+        "--series",
+        type=int,
+        default=DEFAULT_SERIES,
+        help="Series-connected parallel groups per phase (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=DEFAULT_PARALLEL,
+        help="Capacitors in parallel per group (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=DB_FILE,
+        help="Path to SQLite capacitor database (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=RESULT_FILE,
+        help="Path to output Excel file (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=ITERATIONS,
+        help="Number of GA iterations (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--generation-length",
+        type=int,
+        default=GENERATION_LENGTH,
+        help="Population size per generation (default: %(default)s)",
+    )
+    return parser.parse_args()
 
-    df = get_df(DB_FILE)
+
+async def main(  # ruff: ignore[too-many-arguments,too-many-locals]
+    *,
+    series: int = DEFAULT_SERIES,
+    parallel: int = DEFAULT_PARALLEL,
+    db_file: Path = DB_FILE,
+    result_file: Path = RESULT_FILE,
+    iterations: int = ITERATIONS,
+    generation_length: int = GENERATION_LENGTH,
+) -> None:
+    if series < 1 or parallel < 1:
+        msg = "Both --series and --parallel must be >= 1"
+        raise ValueError(msg)
+
+    genoma_len = NUM_PHASES * series * parallel
+    best_len = max(1, int(generation_length * 10 / 100))
+    mut_len = int(generation_length * 20 / 100)
+    shuff_len = int(generation_length * 30 / 100)
+    cross_len = int(generation_length * 10 / 100)
+    rand_len = generation_length - (best_len + mut_len + shuff_len + cross_len)
+
+    df = get_df(db_file)
+    if genoma_len > len(df):
+        msg = (
+            f"Requested 3 * {series} * {parallel} = {genoma_len} capacitors, "
+            f"but database only has {len(df)} rows"
+        )
+        raise ValueError(msg)
 
     # Here we are getting the count of Capacitores by deviation
     """
@@ -267,7 +354,7 @@ async def main() -> None:
     deviation_percent = df_by_deviation["count"] / df_by_deviation["count"].sum()
 
     # Now we got the numbers needed for the lenght of the genoma (Integers).
-    distribution = (GENOMA_LENGTH * deviation_percent).floor()
+    distribution = (genoma_len * deviation_percent).floor()
 
     """
     # print("count of capacitors for each deviation", df_by_deviation)
@@ -276,10 +363,10 @@ async def main() -> None:
     # print("distribution sum:", distribution.sum())
     """
 
-    # if the distribution sum is less than GENOMA_LENGTH, we need to add the missing
-    if distribution.sum() < GENOMA_LENGTH:
+    # if the distribution sum is less than genoma_len, we need to add the missing
+    if distribution.sum() < genoma_len:
         """
-        # print("we are missing", GENOMA_LENGTH - distribution.sum())
+        # print("we are missing", genoma_len - distribution.sum())
         # print(
         #     "for each deviation we have available:",
         #     df_by_deviation["count"] - distribution,
@@ -289,19 +376,20 @@ async def main() -> None:
         #     "the requirement"
         # )
         """
-        needed = GENOMA_LENGTH - float(distribution.sum())
+        needed = genoma_len - float(distribution.sum())
         while needed > 0:
-            available = df_by_deviation["count"] - distribution
-            available = available.filter(available != 0)
-            lower_value: int = min(available)
-            pos = next(i for i, v in enumerate(available) if v == lower_value)
-            distribution[pos] += min(needed, lower_value)
-            needed -= min(needed, lower_value)
+            remaining = df_by_deviation["count"] - distribution
+            lower_value, pos = min(
+                (float(v), i) for i, v in enumerate(remaining) if v > 0
+            )
+            add_amount = min(needed, lower_value)
+            distribution[pos] += add_amount
+            needed -= add_amount
             """
-            # print(f"availables are: {available}")
+            # print(f"availables are: {remaining}")
             # print(
             #     f"position for the min {lower_value} is {pos}. "
-            #     f"We will use {min(needed, lower_value)} to modify this value."
+            #     f"We will use {add_amount} to modify this value."
             # )
             # print(f"now the dist is: {distribution}")
             """
@@ -310,7 +398,7 @@ async def main() -> None:
     # print("Distribution:", distribution)
     """
 
-    assert distribution.sum() == GENOMA_LENGTH  # ruff: ignore[assert]
+    assert distribution.sum() == genoma_len  # ruff: ignore[assert]
     cap_selected_df = pl.DataFrame([])
 
     # Here for each deviation, we got the capacitors from the dataframe
@@ -330,26 +418,38 @@ async def main() -> None:
         ).iter_rows()
     ]
 
-    generation = random_generation(capacitor_options, GENERATION_LENGTH, GENOMA_LENGTH)
+    generation = random_generation(capacitor_options, generation_length, genoma_len)
 
-    for gen in range(ITERATIONS):
+    for gen in range(iterations):
         print(gen, end=" ")  # ruff: ignore[print]
         generation = await update_generation(
             generation,
             capacitor_options,
-            genoma_len=GENOMA_LENGTH,
-            top_len=BEST_GENOMAS_LENGTH,
-            rand_len=RANDOM_LENGTH,
-            cross_len=CROSSOVER_LENGTH,
-            mut_len=MUTATION_LENGTH,
-            shuff_len=SHUFFLE_LENGTH,
+            series=series,
+            parallel=parallel,
+            genoma_len=genoma_len,
+            top_len=best_len,
+            rand_len=rand_len,
+            cross_len=cross_len,
+            mut_len=mut_len,
+            shuff_len=shuff_len,
         )
 
     best_genoma = generation[0]
     capacitors_df = get_selected_capacitors(best_genoma, df)
-    capacitors_df.write_excel(RESULT_FILE, "Capacitors Balanced")
+    capacitors_df.write_excel(result_file, "Capacitors Balanced")
     print("DONE!")  # ruff: ignore[print]
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    cli_args = parse_args()
+    asyncio.run(
+        main(
+            series=cli_args.series,
+            parallel=cli_args.parallel,
+            db_file=cli_args.db,
+            result_file=cli_args.out,
+            iterations=cli_args.iterations,
+            generation_length=cli_args.generation_length,
+        )
+    )

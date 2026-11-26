@@ -11,3 +11,8 @@ wheels/
 
 # results
 parallel_results.xlsx
+
+# server runtime SQLite state
+server/app_state.db*
+*.db-shm
+*.db-wal
