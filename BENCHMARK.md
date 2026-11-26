@@ -104,5 +104,5 @@ uv run mojo build -O 3 --Werror -o mojo_solver/residual_solver mojo_solver/resid
 ./mojo_solver/residual_solver --bench 1000
 
 # 4. Run Python baseline
-PYTHONPATH=src uv run python src/capacitor_balance/functional_program.py
+uv run python -m capacitor_balance.functional_program
 ```

@@ -1,7 +1,11 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "capacitor-balance"
 version = "0.1.0"
-description = "Add your description here"
+description = "3-phase (A, B, C) series-parallel HV capacitor bank balancer in Python/Polars and Mojo"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -9,6 +13,12 @@ dependencies = [
     "polars>=2.2.0",
     "xlsxwriter>=3.3.4",
 ]
+
+[project.scripts]
+capacitor-balance-server = "server.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/capacitor_balance", "server"]
 
 [tool.ty.analysis]
 strict-equality-semantics = true

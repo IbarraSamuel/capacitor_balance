@@ -8,7 +8,7 @@ prerelease-mode = "allow"
 [[package]]
 name = "capacitor-balance"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "mojo" },
     { name = "polars" },

@@ -55,14 +55,14 @@ A fitness of `0.0` means every parallel group has the exact same total capacitan
 ### Install & Run
 
 ```bash
-# Sync dependencies (polars, xlsxwriter)
+# Sync dependencies and install package editably (mojo nightly, polars, xlsxwriter)
 uv sync
 
 # Run the genetic algorithm (default: 3 phases × 6 series × 9 parallel = 162 capacitors)
-PYTHONPATH=src uv run python src/capacitor_balance/functional_program.py
+uv run python -m capacitor_balance.functional_program
 
 # Or choose a custom 3-phase bank size (e.g. 3 × 4 × 5 = 60 capacitors)
-PYTHONPATH=src uv run python src/capacitor_balance/functional_program.py \
+uv run python -m capacitor_balance.functional_program \
   --series 4 --parallel 5 --iterations 200 --generation-length 500
 ```
 
@@ -176,7 +176,8 @@ A zero-framework Python HTTP server (`server/app.py`, stdlib `ThreadingHTTPServe
 uv sync
 
 # Launch the web server (auto-builds mojo_solver/capacitor_mojo.so on first solve)
-PYTHONPATH=src:. uv run python -m server.app --host 127.0.0.1 --port 8080
+uv run capacitor-balance-server --host 127.0.0.1 --port 8080
+# or: uv run python -m server.app --host 127.0.0.1 --port 8080
 ```
 
 ### Web App Features
