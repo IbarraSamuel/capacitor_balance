@@ -1,12 +1,18 @@
 # Capacitor Balance — Architecture & Algorithm Design
 
-This document traces the design evolution of the Capacitor Balance solver across three stages:
+This document traces the design evolution of the Capacitor Balance solver across four stages:
 
 1. **Initial Python + Polars implementation** (eager per-genoma DataFrame evaluation & async-generator GA)
 2. **Optimized Python + Polars implementation** (vectorized `LazyFrame.collect_async()`, concurrent offspring generation, and $O(N)$ set operations)
-3. **Native Mojo implementation** (`mojo_solver/solver.mojo`) in two modes:
+3. **Native Mojo implementations** (`mojo_solver/solver.mojo` & `mojo_solver/residual_solver.mojo`):
    - **`--mode ga`**: faithful genetic-algorithm parity with Python on flat memory + SIMD
    - **`--mode fast`**: greedy LPT initialization + incremental 2-opt local search achieving the exact global optimum (`0.0`)
+   - **`residual_solver`**: tightest-window snake/LPT + algebraic max-min residual matching + phase A/B/C reciprocal balancing (`~20–36 µs`)
+4. **In-process Mojo `.so` Python extension & Lightweight SQLite Web App** (`mojo_solver/capacitor_mojo.mojo`, `server/`, `visualizer/index.html`):
+   - Native `.so` shared library loaded directly in Python (zero subprocess overhead)
+   - Multi-tab (max 10) interactive bank & stock editor with strict CSV/XLSX validation and a 50-concurrent-user cap persisted in SQLite
+
+All solvers support configurable 3-phase (**A, B, C**) bank dimensions via `--series` (default `6`) and `--parallel` (default `9`), yielding `3 × series × parallel` total capacitors.
 
 ---
 
@@ -194,7 +200,36 @@ While `solver.mojo --mode fast` reaches `0.0` in `1.46 ms`, it still scans all $
 
 ---
 
-## 5. Summary Comparison
+## 5. Stage 4 — In-Process Mojo `.so` Extension & Lightweight Web Server
+
+### Mojo Python Extension (`mojo_solver/core.mojo` + `mojo_solver/capacitor_mojo.mojo`)
+
+To eliminate OS process launch, temporary SQLite files, and CSV serialization when invoking Mojo from Python, the shared solver algorithms were extracted into [mojo_solver/core.mojo](mojo_solver/core.mojo) (no `main()`) and exposed to CPython via [mojo_solver/capacitor_mojo.mojo](mojo_solver/capacitor_mojo.mojo) using `std.python.bindings.PythonModuleBuilder`:
+
+- Compiled via `uv run mojo build -I mojo_solver --emit shared-lib -O 3 --Werror -o mojo_solver/capacitor_mojo.so mojo_solver/capacitor_mojo.mojo`.
+- Exports `solve_residual`, `solve_fast`, and `solve_ga` directly across the C ABI (`PyInit_capacitor_mojo`).
+- `server/solvers.py` auto-builds `capacitor_mojo.so` if missing or stale and loads it once via `importlib.util.spec_from_file_location`, cutting end-to-end Python call latency for the residual solver from **14.6 ms** (CLI subprocess) down to **0.155 ms** (**94× faster**).
+
+### Lightweight HTTP Server & Interactive Multi-Tab UI (`server/` + `visualizer/index.html`)
+
+```mermaid
+flowchart LR
+    UI["Browser UI (visualizer/index.html)"] --> HTTP["ThreadingHTTPServer (server/app.py)"]
+    HTTP --> Gate["50-User Concurrency Gate (SQLite active_sessions)"]
+    Gate --> Parser["CSV / XLSX Validator (server/parser.py)"]
+    Gate --> Solvers["Speed-Sorted Solvers (server/solvers.py)"]
+    Solvers --> SO["capacitor_mojo.so (In-Process)"]
+    Solvers --> PY["Python + Polars GA"]
+    Gate --> DB["SQLite WAL State (server/app_state.db)"]
+```
+
+- **Zero web-framework dependencies**: Built on Python's stdlib `ThreadingHTTPServer`, `sqlite3` (WAL mode), and stdlib `zipfile` + XML for `.xlsx` parsing.
+- **SQLite state schema** (`server/db.py`): Stores `active_sessions` (50-user sliding-TTL concurrency cap; 51st user receives HTTP `503`), `bank_tabs` (up to 10 independent bank tabs per session), `tab_capacitors` (`slot_position = NULL` when in Stock, `0..N-1` when placed in the bank), and `solve_runs` (solver audit log).
+- **Upload & interactive workflow**: Strict validation of `serial` (`str`), `capacitance` (`float > 0`), and `deviation` (`int`); uploaded units start in the visual **Stock** panel with an **empty bank**; users can run any speed-ranked solver (with loading indicator) or manually swap, place from stock, and remove capacitors with instant live phase-balance recalculation.
+
+---
+
+## 6. Summary Comparison
 
 | Dimension | Stage 1: Initial Python | Stage 2: Optimized Python | Stage 3A: Mojo GA | Stage 3B: Mojo Fast | Stage 3C: Mojo Residual |
 |---|---|---|---|---|---|

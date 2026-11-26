@@ -1,4 +1,4 @@
-# python generated files
+# Python generated files
 __pycache__/
 *.py[oc]
 build/
@@ -6,13 +6,27 @@ dist/
 wheels/
 *.egg-info
 
-# venv
-.venv
+# Virtual environments & caches
+.venv/
+.ruff_cache/
+__mojocache__/
+.mojo_cache/
 
-# results
+# Compiled binaries & shared libraries
+*.so
+*.dylib
+*.dll
+*.o
+mojo_solver/solver
+mojo_solver/residual_solver
+
+# Generated solver outputs & runtime SQLite state
 parallel_results.xlsx
-
-# server runtime SQLite state
+mojo_solver/*_results.csv
 server/app_state.db*
 *.db-shm
 *.db-wal
+
+# OS / editor metadata
+.DS_Store
+*.swp

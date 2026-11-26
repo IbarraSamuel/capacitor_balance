@@ -19,7 +19,7 @@ where:
 | **Hardware** | Apple M1 (8 cores: 4 performance + 4 efficiency) |
 | **OS** | macOS (ARM64) |
 | **Python** | CPython 3.15.2 (`uv`), Polars 2.2.0 |
-| **Mojo** | `Mojo 1.3.0.dev2026112405 (c59227e9)`, compiled with `mojo build -O 3 --Werror` |
+| **Mojo** | `Mojo 1.3.0.dev2026112505` (nightly wheel via `uv`), compiled with `mojo build -O 3 --Werror` |
 | **Dataset** | `src/capacitor_balance/capacitors.db` (321 valid capacitors) |
 
 ## Implementations Compared
@@ -42,7 +42,17 @@ where:
 | **Mojo Fast (`--mode fast`)** | 20 | **17.7 ms** | 17.8 ms / 16.8 ms / 18.2 ms | **1.46 ms** / 1.45 ms | **1,043×** | **12,666×** |
 | **Mojo Residual (`residual_solver`)** | 20 *(+1000 warm)* | **14.6 ms** | 14.1 ms / 13.5 ms / 24.1 ms | **36.2 µs** cold / **19.7 µs** warm | **1,267×** | **509,000×** *(cold)* / **934,000×** *(warm)* |
 
-> **Note:** Process wall time for Mojo includes OS process spawn (`subprocess.run`), dynamic loading of `libsqlite3.dylib`, reading the SQLite database, solving, and writing CSV output. On `residual_solver`, 99.7% of process wall time is OS/SQLite I/O; the solve itself finishes in **10 moves** (**36.2 µs** cold, **19.7 µs** warm across 1,000 runs, **18.0 µs** min).
+> **Note:** Process wall time for Mojo CLI includes OS process spawn (`subprocess.run`), dynamic loading of `libsqlite3.dylib`, reading the SQLite database, solving, and writing CSV output. On `residual_solver`, 99.7% of CLI wall time is OS/SQLite I/O; the solve itself finishes in **10 moves** (**36.2 µs** cold, **19.7 µs** warm across 1,000 runs, **18.0 µs** min).
+
+### In-Process Python `.so` Extension (`mojo_solver/capacitor_mojo.so`)
+
+Calling Mojo directly from Python via the compiled shared library (`--emit shared-lib`) eliminates subprocess startup, temporary SQLite I/O, and CSV serialization:
+
+| Python Call (`import capacitor_mojo`) | End-to-End Python Time | Mojo Inner Solve Time | Speedup vs. Mojo CLI Subprocess | Fitness |
+|---|---:|---:|---:|---:|
+| `capacitor_mojo.solve_residual(caps, 6, 9)` | **0.155 ms** *(155 µs)* | **0.044–0.051 ms** | **94× faster** *(vs. 14.6 ms)* | `5.44 × 10⁻¹⁵` |
+| `capacitor_mojo.solve_fast(caps, 6, 9, 42)` | **2.76 ms** | **2.59–2.72 ms** | **6.4× faster** *(vs. 17.7 ms)* | **`0.0`** |
+| `capacitor_mojo.solve_ga(caps, 6, 9, 1000, 500, 42)` | **282.3 ms** | **281.2–282.2 ms** | **1.18× faster** *(vs. 334 ms)* | `7.67 × 10⁻⁴` |
 
 ### Accuracy & Cross-Verification
 
@@ -77,15 +87,22 @@ Every Mojo solution (10 GA runs, 20 Fast runs, and 20 Residual runs) was loaded 
 ## How to Reproduce
 
 ```bash
-# 1. Build the Mojo solvers
-mojo build -O 3 --Werror -o mojo_solver/solver mojo_solver/solver.mojo
-mojo build -O 3 --Werror -o mojo_solver/residual_solver mojo_solver/residual_solver.mojo
+# 0. Sync dependencies (includes Mojo nightly, Polars, XlsxWriter)
+uv sync
 
-# 2. Run Mojo (GA parity, fast local search, and microsecond residual balancer)
+# 1. Build the in-process Mojo Python extension (.so)
+uv run mojo build -I mojo_solver --emit shared-lib -O 3 --Werror \
+  -o mojo_solver/capacitor_mojo.so mojo_solver/capacitor_mojo.mojo
+
+# 2. Build standalone Mojo CLI solvers (optional)
+uv run mojo build -O 3 --Werror -o mojo_solver/solver mojo_solver/solver.mojo
+uv run mojo build -O 3 --Werror -o mojo_solver/residual_solver mojo_solver/residual_solver.mojo
+
+# 3. Run Mojo CLI (GA parity, fast local search, and microsecond residual balancer)
 ./mojo_solver/solver --mode ga --seed 42
 ./mojo_solver/solver --mode fast --seed 42
 ./mojo_solver/residual_solver --bench 1000
 
-# 3. Run Python baseline
+# 4. Run Python baseline
 PYTHONPATH=src uv run python src/capacitor_balance/functional_program.py
 ```

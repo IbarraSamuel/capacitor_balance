@@ -1,57 +1,68 @@
-"""Unified solver dispatch (sorted fastest -> slowest) for the web server."""
+"""Unified solver dispatch (sorted fastest -> slowest) using the Mojo .so extension."""
 
 from __future__ import annotations
 
 import asyncio
-import csv
+import importlib.util
+import shutil
 import sqlite3
 import subprocess  # ruff: ignore[suspicious-subprocess-import]
-import tempfile
+import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from capacitor_balance import functional_program as py_fp
 
+if TYPE_CHECKING:
+    from types import ModuleType
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
-MOJO_RESIDUAL_BIN = REPO_ROOT / "mojo_solver" / "residual_solver"
-MOJO_SOLVER_BIN = REPO_ROOT / "mojo_solver" / "solver"
+MOJO_DIR = REPO_ROOT / "mojo_solver"
+MOJO_EXT_SRC = MOJO_DIR / "capacitor_mojo.mojo"
+MOJO_CORE_SRC = MOJO_DIR / "core.mojo"
+MOJO_EXT_SO = MOJO_DIR / "capacitor_mojo.so"
 SAMPLE_DB_PATH = REPO_ROOT / "src" / "capacitor_balance" / "capacitors.db"
+
+_MOJO_EXT_LOCK = threading.Lock()
+_MOJO_EXT_CACHE: dict[str, ModuleType | None] = {"mod": None}
 
 SOLVER_CATALOG: list[dict[str, Any]] = [
     {
         "id": "mojo_residual",
-        "name": "Mojo Residual Balancer",
+        "name": "Mojo Residual Balancer (.so)",
         "speed_rank": 1,
         "speed_bars": 5,
         "speed_label": "Instant (~0.04 ms)",
         "speed_tier": "instant",
         "description": (
-            "Algebraic max-min residual matching + binary-searched pool swaps + "
-            "phase A/B/C reciprocal balancing."
+            "In-process Mojo .so C-extension: algebraic max-min residual matching + "
+            "binary-searched pool swaps + phase A/B/C reciprocal balancing."
         ),
     },
     {
         "id": "mojo_fast",
-        "name": "Mojo Local Search (2-Opt)",
+        "name": "Mojo Local Search 2-Opt (.so)",
         "speed_rank": 2,
         "speed_bars": 4,
-        "speed_label": "Ultra Fast (~1.5 ms)",
+        "speed_label": "Ultra Fast (~2 ms)",
         "speed_tier": "ultra",
         "description": (
-            "Greedy LPT initialization + exhaustive incremental 2-opt inter-group "
-            "swaps and pool replacements."
+            "In-process Mojo .so C-extension: greedy LPT initialization + "
+            "exhaustive incremental 2-opt inter-group swaps and pool replacements."
         ),
     },
     {
         "id": "mojo_ga",
-        "name": "Mojo Genetic Algorithm",
+        "name": "Mojo Genetic Algorithm (.so)",
         "speed_rank": 3,
         "speed_bars": 3,
         "speed_label": "Fast (~0.3 s)",
         "speed_tier": "fast",
         "description": (
-            "Native compiled Mojo SIMD genetic algorithm (1,000 pop x 500 iters)."
+            "In-process Mojo .so C-extension: native compiled SIMD genetic "
+            "algorithm (1,000 pop x 500 iters)."
         ),
     },
     {
@@ -69,6 +80,80 @@ SOLVER_CATALOG: list[dict[str, Any]] = [
 ]
 
 VALID_SOLVER_IDS = {s["id"] for s in SOLVER_CATALOG}
+
+
+def _find_mojo_executable() -> str:
+    venv_mojo = Path(sys.executable).parent / "mojo"
+    if venv_mojo.exists():
+        return str(venv_mojo)
+    found = shutil.which("mojo")
+    if found is not None:
+        return found
+    msg = (
+        "Could not locate `mojo` compiler. Run `uv sync` to install the "
+        "Mojo nightly dependency."
+    )
+    raise FileNotFoundError(msg)
+
+
+def _needs_rebuild() -> bool:
+    if not MOJO_EXT_SO.exists():
+        return True
+    so_mtime = MOJO_EXT_SO.stat().st_mtime
+    return any(
+        src.exists() and src.stat().st_mtime > so_mtime
+        for src in (MOJO_EXT_SRC, MOJO_CORE_SRC)
+    )
+
+
+def load_mojo_extension(*, force_rebuild: bool = False) -> ModuleType:
+    """Build (if missing or stale) and import ``mojo_solver/capacitor_mojo.so``.
+
+    Returns:
+        The loaded ``capacitor_mojo`` Python extension module.
+
+    Raises:
+        RuntimeError: If building or loading the shared library fails.
+    """
+    with _MOJO_EXT_LOCK:
+        cached = _MOJO_EXT_CACHE["mod"]
+        if cached is not None and not force_rebuild and not _needs_rebuild():
+            return cached
+
+        if force_rebuild or _needs_rebuild():
+            mojo_bin = _find_mojo_executable()
+            proc = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]
+                [
+                    mojo_bin,
+                    "build",
+                    "-I",
+                    str(MOJO_DIR),
+                    "--emit",
+                    "shared-lib",
+                    "-O",
+                    "3",
+                    "--Werror",
+                    "-o",
+                    str(MOJO_EXT_SO),
+                    str(MOJO_EXT_SRC),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                err = proc.stderr.strip() or proc.stdout.strip() or "mojo build failed"
+                msg = f"Failed to build {MOJO_EXT_SO.name}: {err}"
+                raise RuntimeError(msg)
+
+        spec = importlib.util.spec_from_file_location("capacitor_mojo", MOJO_EXT_SO)
+        if spec is None or spec.loader is None:
+            msg = f"Unable to create import spec for {MOJO_EXT_SO}"
+            raise RuntimeError(msg)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _MOJO_EXT_CACHE["mod"] = module
+        return module
 
 
 def load_sample_records() -> list[dict[str, Any]]:
@@ -101,78 +186,6 @@ def load_sample_records() -> list[dict[str, Any]]:
             }
         )
     return records
-
-
-def _write_temp_sqlite_db(db_path: Path, capacitors: list[dict[str, Any]]) -> None:
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            'CREATE TABLE "capacitors" ('
-            '"N°" INTEGER, '
-            '"N° DE SERIE" TEXT, '
-            '"CAPACITANCIA " REAL, '
-            '"CAP. DESVIACION " INTEGER)'
-        )
-        conn.executemany(
-            "INSERT INTO capacitors VALUES (?, ?, ?, ?)",
-            [
-                (
-                    i + 1,
-                    str(cap["serial"]),
-                    float(cap["capacitance"]),
-                    int(cap["deviation"]),
-                )
-                for i, cap in enumerate(capacitors)
-            ],
-        )
-        conn.commit()
-
-
-def _run_mojo_binary(
-    binary: Path,
-    args: list[str],
-    capacitors: list[dict[str, Any]],
-) -> tuple[list[int], float, float]:
-    if not binary.exists():
-        msg = f"Mojo binary not found at {binary}. Build it first with `mojo build`."
-        raise FileNotFoundError(msg)
-
-    with tempfile.TemporaryDirectory(prefix="cap_bal_") as tmp_dir:
-        tmp_db = Path(tmp_dir) / "input.db"
-        tmp_csv = Path(tmp_dir) / "output.csv"
-        _write_temp_sqlite_db(tmp_db, capacitors)
-
-        t0 = time.perf_counter()
-        proc = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]
-            [str(binary), "--db", str(tmp_db), "--out", str(tmp_csv), *args],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        if proc.returncode != 0:
-            err = proc.stderr.strip() or proc.stdout.strip() or "Mojo solver failed"
-            raise RuntimeError(err)
-
-        ordered_row_indices: list[int] = []
-        with tmp_csv.open(encoding="utf-8") as fh:
-            for row in csv.DictReader(fh):
-                local_idx = int(row["db_idx"])
-                ordered_row_indices.append(int(capacitors[local_idx]["row_index"]))
-
-        tokens = dict(
-            tok.split("=", 1)
-            for tok in proc.stdout.strip().splitlines()[-1].split()
-            if "=" in tok
-        )
-        fitness = float(tokens.get("best_fit", "0.0"))
-        if "solve_us" in tokens:
-            solve_ms = float(tokens["solve_us"]) / 1000.0
-        elif "solve_s" in tokens:
-            solve_ms = float(tokens["solve_s"]) * 1000.0
-        else:
-            solve_ms = elapsed_ms
-
-        return ordered_row_indices, fitness, solve_ms
 
 
 def _run_python_polars_ga(
@@ -253,44 +266,29 @@ def run_solver(
         )
         raise ValueError(msg)
 
-    if solver_id == "mojo_residual":
-        return _run_mojo_binary(
-            MOJO_RESIDUAL_BIN,
-            ["--series", str(series), "--parallel", str(parallel)],
-            capacitors,
-        )
-    if solver_id == "mojo_fast":
-        return _run_mojo_binary(
-            MOJO_SOLVER_BIN,
-            [
-                "--mode",
-                "fast",
-                "--series",
-                str(series),
-                "--parallel",
-                str(parallel),
-                "--seed",
-                str(seed),
-            ],
-            capacitors,
-        )
-    if solver_id == "mojo_ga":
-        return _run_mojo_binary(
-            MOJO_SOLVER_BIN,
-            [
-                "--mode",
-                "ga",
-                "--series",
-                str(series),
-                "--parallel",
-                str(parallel),
-                "--seed",
-                str(seed),
-            ],
-            capacitors,
-        )
     if solver_id == "python_polars_ga":
         return _run_python_polars_ga(capacitors, series, parallel)
 
-    msg = f"Unknown solver_id: '{solver_id}'"
-    raise ValueError(msg)
+    caps_float = [float(c["capacitance"]) for c in capacitors]
+    ext = load_mojo_extension()
+
+    if solver_id == "mojo_residual":
+        local_indices, fitness, solve_ms = ext.solve_residual(
+            caps_float, series, parallel
+        )
+    elif solver_id == "mojo_fast":
+        local_indices, fitness, solve_ms = ext.solve_fast(
+            caps_float, series, parallel, seed
+        )
+    elif solver_id == "mojo_ga":
+        local_indices, fitness, solve_ms = ext.solve_ga(
+            caps_float, series, parallel, 1000, 500, seed
+        )
+    else:
+        msg = f"Unknown solver_id: '{solver_id}'"
+        raise ValueError(msg)
+
+    ordered_row_indices = [
+        int(capacitors[int(local_idx)]["row_index"]) for local_idx in local_indices
+    ]
+    return ordered_row_indices, float(fitness), float(solve_ms)

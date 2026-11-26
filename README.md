@@ -4,7 +4,10 @@ A 3-phase (**A, B, C**) series-parallel capacitor bank balancer.
 
 Given measured capacitances in `src/capacitor_balance/capacitors.db`, this project selects and arranges **`3 × series × parallel` distinct capacitors** across **3 phases (A, B, C)** (default: **3 phases × 6 series groups × 9 parallel capacitors = 162 units**) so that all parallel groups share capacitance evenly and all three phases achieve near-zero phase-to-phase unbalance.
 
-Both a **Python + Polars** solver and a **native Mojo** solver are included.
+Both a **Python + Polars** solver and **native Mojo** solvers (usable both as CLI binaries and as an in-process `.so` Python extension module) are included.
+
+> [!WARNING]
+> **Mojo Nightly Dependency:** This project depends on **Mojo nightly** (`mojo` from `https://whl.modular.com/nightly/simple/`). Because Mojo nightly is under active development, language syntax, stdlib APIs, and Python extension bindings (`PythonModuleBuilder`) may break between nightly updates. If a newer nightly breaks compilation, pin `mojo` in `pyproject.toml` to the tested nightly version (`1.3.0.dev2026112505`).
 
 ## Project Layout
 
@@ -12,23 +15,22 @@ Both a **Python + Polars** solver and a **native Mojo** solver are included.
 capacitor_balance/
 ├── src/capacitor_balance/
 │   ├── capacitors.db           # Input SQLite database of measured capacitors
-│   ├── functional_program.py   # Async Python + vectorized Polars GA solver
-│   └── parallel_results.xlsx   # Excel output written by the Python solver
+│   └── functional_program.py   # Async Python + vectorized Polars GA solver
 ├── mojo_solver/
-│   ├── solver.mojo             # Native Mojo solver (--mode fast | --mode ga)
-│   ├── residual_solver.mojo    # Alternative sub-millisecond residual-balancing solver
-│   ├── mojo_results.csv        # CSV output written by solver.mojo
-│   └── residual_results.csv    # CSV output written by residual_solver.mojo
+│   ├── core.mojo               # Shared Mojo solver algorithms (no main)
+│   ├── capacitor_mojo.mojo     # Python C-extension module -> capacitor_mojo.so
+│   ├── solver.mojo             # Standalone CLI solver (--mode fast | --mode ga)
+│   └── residual_solver.mojo    # Standalone CLI sub-millisecond residual solver
 ├── server/
 │   ├── app.py                  # Lightweight stdlib HTTP server (50-user cap)
 │   ├── db.py                   # SQLite persistence (sessions, tabs, stock/bank, runs)
 │   ├── parser.py               # Strict CSV & XLSX upload validator + templates
-│   └── solvers.py              # Speed-sorted solver catalog & runner bridge
+│   └── solvers.py              # Speed-sorted solver catalog calling capacitor_mojo.so
 ├── visualizer/
 │   └── index.html              # Interactive multi-tab 3-phase HV bank web UI
 ├── DESIGN.md                   # Architecture & algorithm design details
 ├── BENCHMARK.md                # Timing & accuracy comparison (Python vs. Mojo)
-└── pyproject.toml              # Python dependencies, ruff & ty configuration
+└── pyproject.toml              # Python & Mojo nightly dependencies, ruff & ty config
 ```
 
 ## What the Solver Optimizes
@@ -84,21 +86,37 @@ uv run ty check src/capacitor_balance/functional_program.py
 
 ---
 
-## Using the Mojo Solver
+## Using the Mojo Solver (`.so` Extension & Standalone CLI)
 
 ### Prerequisites
 
-- [Mojo](https://www.modular.com/mojo) (`>= 1.3.0.dev`, tested with `Mojo 1.3.0.dev2026112405`)
-- System `libsqlite3` (built-in on macOS; `libsqlite3.so.0` on Linux)
+- Installed automatically via `uv sync` (`mojo` nightly is listed in `pyproject.toml`)
+- System `libsqlite3` (built-in on macOS; `libsqlite3.so.0` on Linux) for standalone CLI binaries
 
-### Build
+### Build the Python Extension (`.so`)
 
 ```bash
-# GA + 2-opt local search solver
-mojo build -O 3 --Werror -o mojo_solver/solver mojo_solver/solver.mojo
+# Build native Python extension module (auto-built by the web server if missing)
+uv run mojo build -I mojo_solver --emit shared-lib -O 3 --Werror \
+  -o mojo_solver/capacitor_mojo.so mojo_solver/capacitor_mojo.mojo
 
-# Alternative microsecond residual-balancing solver (fastest)
-mojo build -O 3 --Werror -o mojo_solver/residual_solver mojo_solver/residual_solver.mojo
+# Call directly from Python (zero subprocess overhead)
+PYTHONPATH=mojo_solver uv run python -c "
+import capacitor_mojo
+caps = [1.02 + (i % 7) * 0.001 for i in range(200)]
+indices, fitness, solve_ms = capacitor_mojo.solve_residual(caps, 6, 9)
+print(f'placed={len(indices)} fitness={fitness:.3e} solve_ms={solve_ms:.3f}')
+"
+```
+
+### Build Standalone CLI Binaries (Optional)
+
+```bash
+# GA + 2-opt local search CLI
+uv run mojo build -O 3 --Werror -o mojo_solver/solver mojo_solver/solver.mojo
+
+# Alternative microsecond residual-balancing CLI
+uv run mojo build -O 3 --Werror -o mojo_solver/residual_solver mojo_solver/residual_solver.mojo
 ```
 
 ### Run
@@ -154,11 +172,10 @@ A zero-framework Python HTTP server (`server/app.py`, stdlib `ThreadingHTTPServe
 ### Start the Server
 
 ```bash
-# Ensure Mojo binaries are built first (for the fastest solvers)
-mojo build -O 3 --Werror -o mojo_solver/solver mojo_solver/solver.mojo
-mojo build -O 3 --Werror -o mojo_solver/residual_solver mojo_solver/residual_solver.mojo
+# Sync dependencies (includes Mojo nightly, Polars, XlsxWriter)
+uv sync
 
-# Launch the web server (default: http://127.0.0.1:8080, max 50 concurrent users)
+# Launch the web server (auto-builds mojo_solver/capacitor_mojo.so on first solve)
 PYTHONPATH=src:. uv run python -m server.app --host 127.0.0.1 --port 8080
 ```
 
