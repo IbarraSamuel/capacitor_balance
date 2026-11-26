@@ -6,6 +6,7 @@
   <title>HV Capacitor Bank Balancer — 3-Phase Series-Parallel Tool</title>
   <style>
     :root {
+      color-scheme: dark;
       --bg-deep: #080d14;
       --bg-panel: #0f1724;
       --bg-elev: #162235;
@@ -339,16 +340,74 @@
       box-shadow: inset 0 0 0 1px rgba(34, 211, 238, 0.4);
     }
 
-    .num-input {
-      width: 52px;
+    .num-stepper {
+      display: inline-flex;
+      align-items: stretch;
       background: var(--bg-deep);
-      border: 1px solid var(--border);
+      border: 1px solid var(--border-hi);
+      border-radius: 7px;
+      overflow: hidden;
+    }
+
+    .num-stepper:focus-within {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.2);
+    }
+
+    .num-input {
+      width: 38px;
+      background: transparent;
+      border: none;
+      outline: none;
       color: var(--text);
       font-family: var(--mono);
-      font-size: 12px;
-      padding: 5px 6px;
-      border-radius: 6px;
+      font-size: 12.5px;
+      font-weight: 700;
+      padding: 4px 2px 4px 6px;
       text-align: center;
+      appearance: textfield;
+      -moz-appearance: textfield;
+    }
+
+    .num-input::-webkit-inner-spin-button,
+    .num-input::-webkit-outer-spin-button {
+      -webkit-appearance: none;
+      margin: 0;
+    }
+
+    .num-arrows {
+      display: flex;
+      flex-direction: column;
+      border-left: 1px solid var(--border);
+    }
+
+    .num-step-btn {
+      background: var(--bg-elev);
+      border: none;
+      color: var(--accent);
+      font-size: 8.5px;
+      line-height: 1;
+      width: 20px;
+      height: 14px;
+      display: grid;
+      place-items: center;
+      cursor: pointer;
+      padding: 0;
+      transition: background 0.12s, color 0.12s;
+    }
+
+    .num-step-btn:first-child {
+      border-bottom: 1px solid var(--border);
+    }
+
+    .num-step-btn:hover {
+      background: #223654;
+      color: #ffffff;
+    }
+
+    .num-step-btn:active {
+      background: #0284c7;
+      color: #ffffff;
     }
 
     .btn {
@@ -1101,9 +1160,21 @@
         <button data-kv="230">230 kV (12S &times; 9P)</button>
       </div>
       <span class="ctrl-label" style="margin-left:4px;">Series (S)</span>
-      <input id="seriesInput" class="num-input" type="number" min="1" max="24" value="6" />
+      <div class="num-stepper">
+        <input id="seriesInput" class="num-input" type="number" min="1" max="24" value="6" />
+        <div class="num-arrows">
+          <button type="button" class="num-step-btn" data-target="seriesInput" data-delta="1" title="Increase Series" aria-label="Increase Series">&#9650;</button>
+          <button type="button" class="num-step-btn" data-target="seriesInput" data-delta="-1" title="Decrease Series" aria-label="Decrease Series">&#9660;</button>
+        </div>
+      </div>
       <span class="ctrl-label">Parallel (P)</span>
-      <input id="parallelInput" class="num-input" type="number" min="1" max="24" value="9" />
+      <div class="num-stepper">
+        <input id="parallelInput" class="num-input" type="number" min="1" max="24" value="9" />
+        <div class="num-arrows">
+          <button type="button" class="num-step-btn" data-target="parallelInput" data-delta="1" title="Increase Parallel" aria-label="Increase Parallel">&#9650;</button>
+          <button type="button" class="num-step-btn" data-target="parallelInput" data-delta="-1" title="Decrease Parallel" aria-label="Decrease Parallel">&#9660;</button>
+        </div>
+      </div>
       <button id="uploadOpenBtn" class="btn primary">Upload CSV / Excel</button>
       <button id="loadSampleBtn" class="btn" title="Load sample capacitor inventory into stock (bank starts empty)">Load Sample Stock</button>
       <button id="clearBankBtn" class="btn danger" title="Return all placed capacitors back to stock">Empty Bank</button>
@@ -1261,6 +1332,7 @@
       activeUsers: 1,
       maxUsers: 50,
       maxTabs: 10,
+      solveTimeoutS: 60,
       solvers: [],
       selectedSolverId: "mojo_residual",
       tabs: [],
@@ -2012,11 +2084,27 @@
       });
     });
 
+    function applyBankDimensions() {
+      const s = Math.max(1, Math.min(24, Number(document.getElementById("seriesInput").value) || 6));
+      const p = Math.max(1, Math.min(24, Number(document.getElementById("parallelInput").value) || 9));
+      document.getElementById("seriesInput").value = s;
+      document.getElementById("parallelInput").value = p;
+      updateConfig({ series: s, parallel: p });
+    }
+
     ["seriesInput", "parallelInput"].forEach((id) => {
-      document.getElementById(id).addEventListener("change", () => {
-        const s = Math.max(1, Math.min(24, Number(document.getElementById("seriesInput").value) || 6));
-        const p = Math.max(1, Math.min(24, Number(document.getElementById("parallelInput").value) || 9));
-        updateConfig({ series: s, parallel: p });
+      document.getElementById(id).addEventListener("change", applyBankDimensions);
+    });
+
+    document.querySelectorAll(".num-step-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const input = document.getElementById(btn.dataset.target);
+        const delta = Number(btn.dataset.delta);
+        const next = Math.max(1, Math.min(24, (Number(input.value) || 1) + delta));
+        if (next !== Number(input.value)) {
+          input.value = next;
+          applyBankDimensions();
+        }
       });
     });
 
@@ -2094,23 +2182,29 @@
       showToast(`Loaded ${res.uploaded_count} capacitors into Stock (bank is empty)`);
     });
 
-    // Run Solver with Loading Spinner Overlay
+    // Run Solver with Loading Spinner Overlay & 1-minute Timeout
     document.getElementById("runSolverBtn").addEventListener("click", async () => {
       const tab = currentTab();
       if (!tab) return;
       const solver = state.solvers.find(s => s.id === state.selectedSolverId);
+      const timeoutS = state.solveTimeoutS || 60;
       const overlay = document.getElementById("loadingOverlay");
       document.getElementById("loadingTitle").textContent = `Running ${solver?.name || state.selectedSolverId}...`;
       const t0 = performance.now();
       const timer = setInterval(() => {
-        document.getElementById("loadingSub").textContent = `Elapsed: ${((performance.now() - t0) / 1000).toFixed(2)} s`;
+        document.getElementById("loadingSub").textContent =
+          `Elapsed: ${((performance.now() - t0) / 1000).toFixed(2)} s (timeout: ${timeoutS}s)`;
       }, 60);
       overlay.classList.add("open");
+
+      const controller = new AbortController();
+      const abortTimer = setTimeout(() => controller.abort(), timeoutS * 1000);
 
       try {
         const res = await api(`/api/tabs/${tab.tab_id}/solve`, {
           method: "POST",
           body: JSON.stringify({ solver_id: state.selectedSolverId }),
+          signal: controller.signal,
         });
         upsertTab(res.tab);
         state.selectedCapId = null;
@@ -2121,8 +2215,13 @@
           `Balanced in ${res.solve_ms.toFixed(2)} ms (fitness: ${res.fitness < 1e-12 ? "0.0" : res.fitness.toExponential(2)})`
         );
       } catch (err) {
-        showToast(`Solver error: ${err.message}`);
+        if (err.name === "AbortError") {
+          showToast(`Solver timed out after ${timeoutS}s. Try a faster Mojo solver.`);
+        } else {
+          showToast(`Solver error: ${err.message}`);
+        }
       } finally {
+        clearTimeout(abortTimer);
         clearInterval(timer);
         overlay.classList.remove("open");
       }
@@ -2274,6 +2373,7 @@
         state.activeUsers = data.active_users;
         state.maxUsers = data.max_users;
         state.maxTabs = data.max_tabs;
+        state.solveTimeoutS = data.solve_timeout_s || 60;
         state.solvers = data.solvers;
         state.selectedSolverId = data.solvers[0]?.id || "mojo_residual";
         state.tabs = data.tabs;

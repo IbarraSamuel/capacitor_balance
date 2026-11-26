@@ -30,7 +30,12 @@ from server.parser import (
     build_template_xlsx,
     parse_and_validate_upload,
 )
-from server.solvers import SOLVER_CATALOG, load_sample_records, run_solver
+from server.solvers import (
+    DEFAULT_SOLVE_TIMEOUT_SECONDS,
+    SOLVER_CATALOG,
+    load_sample_records,
+    run_solver,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 UI_FILE = REPO_ROOT / "visualizer" / "index.html"
@@ -96,10 +101,12 @@ class BalancerHTTPServer(ThreadingHTTPServer):
         server_address: tuple[str, int],
         db: ServerDB,
         ui_path: Path = UI_FILE,
+        solve_timeout: float = DEFAULT_SOLVE_TIMEOUT_SECONDS,
     ) -> None:
-        """Initialize the HTTP server with SQLite DB and UI file path."""
+        """Initialize the HTTP server with SQLite DB, UI path, and timeout."""
         self.db = db
         self.ui_path = ui_path
+        self.solve_timeout = solve_timeout
         super().__init__(server_address, BalancerRequestHandler)
 
 
@@ -227,6 +234,7 @@ class BalancerRequestHandler(BaseHTTPRequestHandler):
                     "active_users": active_users,
                     "max_users": db.max_concurrent_users,
                     "max_tabs": MAX_TABS_PER_SESSION,
+                    "solve_timeout_s": self._balancer_server.solve_timeout,
                     "required_columns": list(REQUIRED_COLUMNS),
                     "solvers": SOLVER_CATALOG,
                     "tabs": db.list_tabs(session_id),
@@ -389,6 +397,7 @@ class BalancerRequestHandler(BaseHTTPRequestHandler):
                 series=int(tab["series"]),
                 parallel=int(tab["parallel"]),
                 seed=seed,
+                timeout_seconds=self._balancer_server.solve_timeout,
             )
             updated = db.apply_solution(
                 session_id,
@@ -456,6 +465,16 @@ class BalancerRequestHandler(BaseHTTPRequestHandler):
             )
         except NotFoundError as exc:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+        except TimeoutError as exc:
+            msg = (
+                str(exc)
+                or f"Solver timed out after {self._balancer_server.solve_timeout:g} "
+                "seconds. Try a faster Mojo solver."
+            )
+            self._send_json(
+                HTTPStatus.GATEWAY_TIMEOUT,
+                {"error": msg, "code": "SOLVER_TIMEOUT"},
+            )
         except (KeyError, ValueError, TypeError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except (FileNotFoundError, RuntimeError) as exc:
@@ -518,20 +537,21 @@ class BalancerRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"tabs": tabs}, session_id=session_id)
 
 
-def create_server(
+def create_server(  # ruff: ignore[too-many-arguments]
     host: str = "127.0.0.1",
     port: int = 8080,
     *,
     db_path: Path = DEFAULT_DB_PATH,
     max_users: int = DEFAULT_MAX_CONCURRENT_USERS,
     session_ttl: float = DEFAULT_SESSION_TTL_SECONDS,
+    solve_timeout: float = DEFAULT_SOLVE_TIMEOUT_SECONDS,
 ) -> BalancerHTTPServer:
     db = ServerDB(
         db_path,
         max_concurrent_users=max_users,
         session_ttl_seconds=session_ttl,
     )
-    return BalancerHTTPServer((host, port), db)
+    return BalancerHTTPServer((host, port), db, solve_timeout=solve_timeout)
 
 
 def main() -> None:
@@ -556,6 +576,18 @@ def main() -> None:
         default=DEFAULT_MAX_CONCURRENT_USERS,
         help="Maximum concurrent user sessions (default: 50)",
     )
+    parser.add_argument(
+        "--session-timeout",
+        type=float,
+        default=DEFAULT_SESSION_TTL_SECONDS,
+        help="Idle user session timeout in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--solve-timeout",
+        type=float,
+        default=DEFAULT_SOLVE_TIMEOUT_SECONDS,
+        help="Maximum solver execution time in seconds (default: 60)",
+    )
     args = parser.parse_args()
 
     srv = create_server(
@@ -563,10 +595,13 @@ def main() -> None:
         args.port,
         db_path=args.db,
         max_users=args.max_users,
+        session_ttl=args.session_timeout,
+        solve_timeout=args.solve_timeout,
     )
     print(  # ruff: ignore[print]
         f"Capacitor Bank Balancer server listening on "
-        f"http://{args.host}:{args.port} (max_users={args.max_users}, db={args.db})"
+        f"http://{args.host}:{args.port} "
+        f"(max_users={args.max_users}, timeout={args.solve_timeout:g}s, db={args.db})"
     )
     try:
         srv.serve_forever()

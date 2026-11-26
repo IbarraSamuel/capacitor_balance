@@ -10,6 +10,8 @@ import subprocess  # ruff: ignore[suspicious-subprocess-import]
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +26,7 @@ MOJO_EXT_SRC = MOJO_DIR / "capacitor_mojo.mojo"
 MOJO_CORE_SRC = MOJO_DIR / "core.mojo"
 MOJO_EXT_SO = MOJO_DIR / "capacitor_mojo.so"
 SAMPLE_DB_PATH = REPO_ROOT / "src" / "capacitor_balance" / "capacitors.db"
+DEFAULT_SOLVE_TIMEOUT_SECONDS = 60.0
 
 _MOJO_EXT_LOCK = threading.Lock()
 _MOJO_EXT_CACHE: dict[str, ModuleType | None] = {"mod": None}
@@ -106,13 +109,18 @@ def _needs_rebuild() -> bool:
     )
 
 
-def load_mojo_extension(*, force_rebuild: bool = False) -> ModuleType:
+def load_mojo_extension(
+    *,
+    force_rebuild: bool = False,
+    timeout_seconds: float = DEFAULT_SOLVE_TIMEOUT_SECONDS,
+) -> ModuleType:
     """Build (if missing or stale) and import ``mojo_solver/capacitor_mojo.so``.
 
     Returns:
         The loaded ``capacitor_mojo`` Python extension module.
 
     Raises:
+        TimeoutError: If compiling the shared library exceeds timeout_seconds.
         RuntimeError: If building or loading the shared library fails.
     """
     with _MOJO_EXT_LOCK:
@@ -122,25 +130,33 @@ def load_mojo_extension(*, force_rebuild: bool = False) -> ModuleType:
 
         if force_rebuild or _needs_rebuild():
             mojo_bin = _find_mojo_executable()
-            proc = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]
-                [
-                    mojo_bin,
-                    "build",
-                    "-I",
-                    str(MOJO_DIR),
-                    "--emit",
-                    "shared-lib",
-                    "-O",
-                    "3",
-                    "--Werror",
-                    "-o",
-                    str(MOJO_EXT_SO),
-                    str(MOJO_EXT_SRC),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            try:
+                proc = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]
+                    [
+                        mojo_bin,
+                        "build",
+                        "-I",
+                        str(MOJO_DIR),
+                        "--emit",
+                        "shared-lib",
+                        "-O",
+                        "3",
+                        "--Werror",
+                        "-o",
+                        str(MOJO_EXT_SO),
+                        str(MOJO_EXT_SRC),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                msg = (
+                    f"Building {MOJO_EXT_SO.name} timed out after "
+                    f"{timeout_seconds:g}s."
+                )
+                raise TimeoutError(msg) from exc
             if proc.returncode != 0:
                 err = proc.stderr.strip() or proc.stdout.strip() or "mojo build failed"
                 msg = f"Failed to build {MOJO_EXT_SO.name}: {err}"
@@ -188,13 +204,14 @@ def load_sample_records() -> list[dict[str, Any]]:
     return records
 
 
-def _run_python_polars_ga(
+def _run_python_polars_ga(  # ruff: ignore[too-many-arguments]
     capacitors: list[dict[str, Any]],
     series: int,
     parallel: int,
     *,
     iterations: int = 500,
     generation_length: int = 1000,
+    timeout_seconds: float = DEFAULT_SOLVE_TIMEOUT_SECONDS,
 ) -> tuple[list[int], float, float]:
     genoma_len = 3 * series * parallel
     best_len = max(1, int(generation_length * 10 / 100))
@@ -212,9 +229,17 @@ def _run_python_polars_ga(
         for c in capacitors
     ]
 
+    t0 = time.perf_counter()
+
     async def _evolve() -> tuple[list[int], float]:
         generation = py_fp.random_generation(options, generation_length, genoma_len)
         for _ in range(iterations):
+            if time.perf_counter() - t0 > timeout_seconds:
+                msg = (
+                    f"Solver 'python_polars_ga' timed out after "
+                    f"{timeout_seconds:g} seconds. Try a faster Mojo solver."
+                )
+                raise TimeoutError(msg)
             sorted_gen, _ = await py_fp.sort_generation(
                 generation, series=series, parallel=parallel
             )
@@ -236,27 +261,30 @@ def _run_python_polars_ga(
         )
         return [int(c["idx"]) for c in final_sorted[0]], float(best_fit)
 
-    t0 = time.perf_counter()
-    ordered_indices, best_fit = asyncio.run(_evolve())
+    ordered_indices, best_fit = asyncio.run(
+        asyncio.wait_for(_evolve(), timeout=timeout_seconds)
+    )
     solve_ms = (time.perf_counter() - t0) * 1000.0
     return ordered_indices, best_fit, solve_ms
 
 
-def run_solver(
+def run_solver(  # ruff: ignore[too-many-arguments]
     solver_id: str,
     capacitors: list[dict[str, Any]],
     *,
     series: int,
     parallel: int,
     seed: int = 42,
+    timeout_seconds: float = DEFAULT_SOLVE_TIMEOUT_SECONDS,
 ) -> tuple[list[int], float, float]:
-    """Execute the selected solver on uploaded capacitors.
+    """Execute the selected solver on uploaded capacitors with a timeout.
 
     Returns:
         Tuple of (ordered_row_indices, fitness, solve_ms).
 
     Raises:
         ValueError: If capacitor count is insufficient or solver_id is unknown.
+        TimeoutError: If the solver does not finish within timeout_seconds.
     """
     needed = 3 * series * parallel
     if len(capacitors) < needed:
@@ -267,26 +295,44 @@ def run_solver(
         raise ValueError(msg)
 
     if solver_id == "python_polars_ga":
-        return _run_python_polars_ga(capacitors, series, parallel)
+        return _run_python_polars_ga(
+            capacitors, series, parallel, timeout_seconds=timeout_seconds
+        )
 
-    caps_float = [float(c["capacitance"]) for c in capacitors]
-    ext = load_mojo_extension()
-
-    if solver_id == "mojo_residual":
-        local_indices, fitness, solve_ms = ext.solve_residual(
-            caps_float, series, parallel
-        )
-    elif solver_id == "mojo_fast":
-        local_indices, fitness, solve_ms = ext.solve_fast(
-            caps_float, series, parallel, seed
-        )
-    elif solver_id == "mojo_ga":
-        local_indices, fitness, solve_ms = ext.solve_ga(
-            caps_float, series, parallel, 1000, 500, seed
-        )
-    else:
+    if solver_id not in VALID_SOLVER_IDS:
         msg = f"Unknown solver_id: '{solver_id}'"
         raise ValueError(msg)
+
+    caps_float = [float(c["capacitance"]) for c in capacitors]
+    ext = load_mojo_extension(timeout_seconds=timeout_seconds)
+
+    def _invoke_mojo() -> tuple[list[int], float, float]:
+        if solver_id == "mojo_residual":
+            raw_indices, raw_fit, raw_ms = ext.solve_residual(
+                caps_float, series, parallel
+            )
+        elif solver_id == "mojo_fast":
+            raw_indices, raw_fit, raw_ms = ext.solve_fast(
+                caps_float, series, parallel, seed
+            )
+        else:
+            raw_indices, raw_fit, raw_ms = ext.solve_ga(
+                caps_float, series, parallel, 1000, 500, seed
+            )
+        return [int(i) for i in raw_indices], float(raw_fit), float(raw_ms)
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_invoke_mojo)
+    try:
+        local_indices, fitness, solve_ms = future.result(timeout=timeout_seconds)
+    except FuturesTimeoutError as exc:
+        executor.shutdown(wait=False, cancel_futures=True)
+        msg = (
+            f"Solver '{solver_id}' timed out after {timeout_seconds:g} seconds."
+        )
+        raise TimeoutError(msg) from exc
+    else:
+        executor.shutdown(wait=False)
 
     ordered_row_indices = [
         int(capacitors[int(local_idx)]["row_index"]) for local_idx in local_indices
